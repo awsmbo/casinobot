@@ -1,0 +1,14 @@
+[Unit]
+Description=Casino Telegram Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/casinobot
+ExecStart=/root/casinobot/venv/bin/python bot.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
