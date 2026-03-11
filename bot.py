@@ -212,7 +212,8 @@ async def spin(message: types.Message):
 
     await db.change_balance(winner_id, chat_id, total_bank)
 
-    await message.reply(
+    await countdown_msg.edit_text(
+        f"🎰 Запуск колеса...\n\n"
         f"🏆 Победитель: {winner_name}\n"
         f"💰 Выигрыш: {total_bank}"
     )
