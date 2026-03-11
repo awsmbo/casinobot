@@ -1,0 +1,9 @@
+venv/
+.env
+casino.db
+casino.db-shm
+casino.db-wal
+__pycache__/
+*.pyc
+*.pyo
+.Python
