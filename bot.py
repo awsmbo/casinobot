@@ -354,6 +354,11 @@ async def coinflip(message: types.Message):
 # rob
 @dp.message(Command("rob"))
 async def rob(message: types.Message):
+    bal = await db.get_balance(message.from_user.id, message.chat.id)
+    if bal is None:
+        await message.reply("Сначала /registration")
+        return
+    
     chat_id = message.chat.id
     user_id = message.from_user.id
 
@@ -404,7 +409,7 @@ async def rob(message: types.Message):
 
     if random.random() > rob_success:
         # Провал — штраф
-        fine_amount = max(1, int(target_bal * fine_pct))
+        fine_amount = max(1, int(bal * fine_pct))
         fine_amount = min(fine_amount, rob_bal)
         if fine_amount > 0:
             await db.change_balance(user_id, chat_id, -fine_amount)
