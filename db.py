@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 
 import aiosqlite
 
@@ -139,12 +140,35 @@ async def change_balance(user_id, chat_id, amount):
 
 
 async def set_bet(user_id, chat_id, amount):
-    async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute(
+    async with aiosqlite.connect(DB_NAME) as conn:
+        await conn.execute(
             "INSERT OR REPLACE INTO bets VALUES (?, ?, ?)",
             (user_id, chat_id, amount),
         )
-        await db.commit()
+        await conn.commit()
+
+
+async def place_bet_atomic(user_id, chat_id, username: str, amount: int, current_bet: Optional[int]):
+    """Атомарно: списание, ставка, обновление username в одной транзакции."""
+    new_total = amount + (current_bet or 0)
+    async with aiosqlite.connect(DB_NAME) as conn:
+        cursor = await conn.execute(
+            "SELECT balance FROM users WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id),
+        )
+        row = await cursor.fetchone()
+        if not row or row[0] < amount:
+            return None
+        await conn.execute(
+            "UPDATE users SET balance = balance - ?, username = ? WHERE user_id = ? AND chat_id = ?",
+            (amount, username, user_id, chat_id),
+        )
+        await conn.execute(
+            "INSERT OR REPLACE INTO bets VALUES (?, ?, ?)",
+            (user_id, chat_id, new_total),
+        )
+        await conn.commit()
+    return new_total
 
 
 async def get_bet(user_id, chat_id):

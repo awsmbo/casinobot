@@ -162,14 +162,16 @@ async def balance(message: types.Message):
 # ставка
 @dp.message(Command("bet"))
 async def bet(message: types.Message):
-    args = message.text.split()
+    if not message.from_user:
+        return
 
-    if len(args) != 2:
+    parts = (message.text or "").strip().split()
+    if len(parts) < 2:
         await message.reply("Использование: /bet 100")
         return
 
     try:
-        amount = int(args[1])
+        amount = int(parts[1])
     except ValueError:
         await message.reply("Ставка должна быть числом.")
         return
@@ -180,24 +182,20 @@ async def bet(message: types.Message):
 
     chat_id = message.chat.id
     user_id = message.from_user.id
-    balance_val = await db.get_balance(user_id, chat_id)
+    username = message.from_user.username or message.from_user.first_name or "User"
 
-    if balance_val is None:
+    if await db.get_balance(user_id, chat_id) is None:
         await message.reply("Сначала /registration")
         return
 
-    if amount > balance_val:
+    current_bet = await db.get_bet(user_id, chat_id)
+    new_total = await db.place_bet_atomic(user_id, chat_id, username, amount, current_bet)
+
+    if new_total is None:
         await message.reply(f"Недостаточно {mimriks(amount)}.")
         return
 
-    current_bet = await db.get_bet(user_id, chat_id)
     is_add = current_bet is not None
-    new_total = amount + (current_bet or 0)
-
-    await db.change_balance(user_id, chat_id, -amount)
-    await db.set_bet(user_id, chat_id, new_total)
-    await db.update_username(user_id, chat_id, message.from_user.username or message.from_user.first_name)
-
     bets = await db.get_all_bets(chat_id)
     total = sum(b[2] for b in bets)
 
@@ -208,7 +206,10 @@ async def bet(message: types.Message):
 
     text = head + "📊 Текущие ставки:\n" + _format_bets_text(bets, total) + f"\n\n💰 Банк: {total}"
 
-    await _update_or_send_round_message(chat_id, text, reply_to_message=message)
+    try:
+        await _update_or_send_round_message(chat_id, text, reply_to_message=message)
+    except Exception:
+        await message.reply("🎰 Ставка принята! Используйте /bank для просмотра ставок.")
 
 
 # банк
@@ -741,13 +742,11 @@ async def golden_minute_task():
     while True:
         await asyncio.sleep(600)  # проверка каждые 10 минут
         try:
-            async with db.aiosqlite.connect(db.DB_NAME) as conn:
-                cursor = await conn.execute("SELECT DISTINCT chat_id FROM users")
-                rows = await cursor.fetchall()
+            chat_ids = await db.get_chat_ids_with_users()
         except Exception:
             continue
 
-        for (chat_id,) in rows:
+        for chat_id in chat_ids:
             if chat_id in golden_minute_active:
                 continue
             if random.random() > get("golden_minute_chance", 0.15):
