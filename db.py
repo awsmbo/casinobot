@@ -49,6 +49,37 @@ async def init_db():
         )
         """)
 
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS round_messages(
+            chat_id INTEGER PRIMARY KEY,
+            message_id INTEGER
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS round_ready(
+            chat_id INTEGER,
+            user_id INTEGER,
+            PRIMARY KEY (chat_id, user_id)
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS chest_spawns(
+            chat_id INTEGER PRIMARY KEY,
+            last_spawn REAL
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS rob_cooldown(
+            user_id INTEGER,
+            chat_id INTEGER,
+            last_rob REAL,
+            PRIMARY KEY (user_id, chat_id)
+        )
+        """)
+
         if needs_migration:
             for uid, username, balance in old_users:
                 await db.execute(
@@ -153,3 +184,123 @@ async def get_leaderboard(chat_id):
             (chat_id,),
         )
         return await cursor.fetchall()
+
+
+# Round message (for ready button)
+async def set_round_message(chat_id, message_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO round_messages VALUES (?, ?)",
+            (chat_id, message_id),
+        )
+        await db.commit()
+
+
+async def get_round_message(chat_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT message_id FROM round_messages WHERE chat_id = ?",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def clear_round_message(chat_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("DELETE FROM round_messages WHERE chat_id = ?", (chat_id,))
+        await db.execute("DELETE FROM round_ready WHERE chat_id = ?", (chat_id,))
+        await db.commit()
+
+
+async def add_round_ready(chat_id, user_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO round_ready VALUES (?, ?)",
+            (chat_id, user_id),
+        )
+        await db.commit()
+
+
+async def get_round_ready_count(chat_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT COUNT(*) FROM round_ready WHERE chat_id = ?",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+# Chests
+async def get_last_chest_time(chat_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT last_spawn FROM chest_spawns WHERE chat_id = ?",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def set_chest_spawned(chat_id):
+    import time
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO chest_spawns VALUES (?, ?)",
+            (chat_id, time.time()),
+        )
+        await db.commit()
+
+
+# Rob
+async def get_last_rob_time(user_id, chat_id):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT last_rob FROM rob_cooldown WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else 0
+
+
+async def set_rob_used(user_id, chat_id):
+    import time
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO rob_cooldown VALUES (?, ?, ?)",
+            (user_id, chat_id, time.time()),
+        )
+        await db.commit()
+
+
+async def get_chat_ids_with_users():
+    """Возвращает список chat_id, в которых есть пользователи."""
+    async with aiosqlite.connect(DB_NAME) as db_conn:
+        cursor = await db_conn.execute("SELECT DISTINCT chat_id FROM users")
+        rows = await cursor.fetchall()
+        return [r[0] for r in rows]
+
+
+async def get_user_id_by_username(chat_id, username):
+    """Возвращает user_id по username в чате."""
+    async with aiosqlite.connect(DB_NAME) as db_conn:
+        uname = (username or "").lstrip("@").lower()
+        cursor = await db_conn.execute(
+            "SELECT user_id FROM users WHERE chat_id = ? AND LOWER(REPLACE(COALESCE(username,''), '@', '')) = ?",
+            (chat_id, uname),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+# Update username
+async def update_username(user_id, chat_id, username):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE users SET username = ? WHERE user_id = ? AND chat_id = ?",
+            (username, user_id, chat_id),
+        )
+        await db.commit()
