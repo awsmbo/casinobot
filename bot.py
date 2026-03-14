@@ -4,12 +4,13 @@ import time
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from config import BOT_TOKEN, ADMIN_ID
 import db
 from utils import mimriks
+from settings import get_settings, get, set_value, set_multiple, DEFAULTS
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -58,6 +59,15 @@ async def _update_or_send_round_message(chat_id: int, text: str, reply_to_messag
             )
             return msg_id
         except Exception:
+            # Убираем кнопку с предыдущего сообщения перед отправкой нового
+            try:
+                await bot.edit_message_reply_markup(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
             await db.clear_round_message(chat_id)
 
     msg = await bot.send_message(
@@ -70,14 +80,37 @@ async def _update_or_send_round_message(chat_id: int, text: str, reply_to_messag
     return msg.message_id
 
 
+GITHUB_URL = "https://github.com/awsmbo/casinobot"
+
+
+def _private_instructions() -> str:
+    return (
+        "📖 Как использовать бота в чатах:\n\n"
+        "1. Добавьте бота в групповой чат\n"
+        "2. Напишите /registration — получите 500 стартовых мимриков\n"
+        "3. Делайте ставки: /bet 100\n"
+        "4. Когда все готовы — нажмите кнопку «Запустить» под сообщением со ставками\n"
+        "5. Победитель определяется случайно (чем больше ставка — тем выше шанс)\n\n"
+        "Другие команды: /transfer, /coinflip, /rob, /leaderboard\n"
+        "Сундуки и золотая минута появляются случайно!\n\n"
+        f"🔗 Исходный код: {GITHUB_URL}"
+    )
+
+
 # старт
 @dp.message(Command("start"))
 async def start(message: types.Message):
-    await message.reply(
-        "🎰 Добро пожаловать в казино!\n\n"
-        "Начните с /registration, чтобы получить 500 мимриков.\n"
-        "Список команд: /help"
-    )
+    if message.chat.type == "private":
+        await message.reply(
+            "🎰 Добро пожаловать в казино!\n\n"
+            + _private_instructions()
+        )
+    else:
+        await message.reply(
+            "🎰 Добро пожаловать в казино!\n\n"
+            "Начните с /registration, чтобы получить 500 мимриков.\n"
+            "Список команд: /help"
+        )
 
 
 # помощь
@@ -91,7 +124,7 @@ async def help_cmd(message: types.Message):
         "/bank — текущий банк раунда\n"
         "/transfer @user <сумма> — передать мимрики другому игроку\n"
         "/coinflip <сумма> — 50/50: проиграть или удвоить\n"
-        "/rob @user — попытаться украсть мимрики (10% шанс, 1 раз в день)\n"
+        "/rob @user — попытаться украсть мимрики (10% шанс, 1 раз в 30 мин)\n"
         "/leaderboard — топ игроков\n"
         "Сундуки и золотая минута появляются случайно в чате!"
     )
@@ -354,26 +387,94 @@ async def rob(message: types.Message):
         await message.reply("У жертвы слишком мало мимриков для кражи.")
         return
 
+    rob_cooldown = get("rob_cooldown", 1800)
     last_rob = await db.get_last_rob_time(user_id, chat_id)
-    if time.time() - last_rob < 86400:  # 24 часа
-        left = int(86400 - (time.time() - last_rob))
-        h = left // 3600
-        m = (left % 3600) // 60
-        await message.reply(f"⏳ Кража возможна раз в день. Подождите ещё {h}ч {m}м.")
+    if time.time() - last_rob < rob_cooldown:
+        left = int(rob_cooldown - (time.time() - last_rob))
+        m = left // 60
+        await message.reply(f"⏳ Кража возможна раз в {rob_cooldown // 60} минут. Подождите ещё {m} мин.")
         return
 
     await db.set_rob_used(user_id, chat_id)
 
-    if random.random() > 0.1:  # 90% провал
-        await message.reply("🚔 Вас поймали! Кража не удалась.")
+    rob_success = get("rob_success_chance", 0.1)
+    steal_pct = get("rob_steal_percent", 0.2)
+    fine_pct = get("rob_fine_percent", 0.1)
+
+    if random.random() > rob_success:
+        # Провал — штраф
+        fine_amount = max(1, int(target_bal * fine_pct))
+        fine_amount = min(fine_amount, rob_bal)
+        if fine_amount > 0:
+            await db.change_balance(user_id, chat_id, -fine_amount)
+            w = mimriks(fine_amount)
+            await message.reply(f"🚔 Вас поймали! Вы потеряли {fine_amount} {w} (штраф за попытку кражи).")
+        else:
+            await message.reply("🚔 Вас поймали! Кража не удалась. (Штраф не взимается — недостаточно мимриков)")
         return
 
-    steal_amount = max(1, int(target_bal * 0.2))
+    steal_amount = max(1, int(target_bal * steal_pct))
     await db.change_balance(target_id, chat_id, -steal_amount)
     await db.change_balance(user_id, chat_id, steal_amount)
 
     w = mimriks(steal_amount)
     await message.reply(f"💰 Кража удалась! Вы украли {steal_amount} {w}!")
+
+
+# админ: настройки (только в личке)
+SETTINGS_KEYS = {
+    "rob_cooldown": ("Кулдаун кражи (сек)", int, "Тайминги"),
+    "chest_min_interval": ("Мин. интервал сундуков (сек)", int, "Тайминги"),
+    "chest_max_interval": ("Макс. интервал сундуков (сек)", int, "Тайминги"),
+    "golden_minute_duration": ("Длительность золотой минуты (сек)", int, "Тайминги"),
+    "golden_minute_per_message": ("Мимриков за сообщение в зол. мин", int, "Тайминги"),
+    "rob_success_chance": ("Шанс успеха кражи (0-1)", float, "Вероятности"),
+    "golden_minute_chance": ("Шанс золотой минуты (0-1)", float, "Вероятности"),
+    "rob_steal_percent": ("% кражи при успехе (0-1)", float, "Кража"),
+    "rob_fine_percent": ("% штрафа при провале (0-1)", float, "Кража"),
+}
+
+
+@dp.message(Command("settings"))
+async def settings_cmd(message: types.Message):
+    if message.from_user.id != ADMIN_ID or message.chat.type != "private":
+        return
+    s = get_settings()
+    lines = ["⚙️ Текущие настройки:\n"]
+    for key, (desc, _, _) in SETTINGS_KEYS.items():
+        val = s.get(key, DEFAULTS.get(key))
+        if isinstance(val, list):
+            val = str(val)
+        lines.append(f"• {key}: {val} ({desc})")
+    lines.append("\nИзменить: /set <ключ> <значение>")
+    await message.reply("\n".join(lines))
+
+
+@dp.message(Command("set"))
+async def set_cmd(message: types.Message):
+    if message.from_user.id != ADMIN_ID or message.chat.type != "private":
+        return
+    args = message.text.split(maxsplit=2)
+    if len(args) < 3:
+        await message.reply(
+            "Использование: /set <ключ> <значение>\n"
+            "Ключи: rob_cooldown, chest_min_interval, chest_max_interval, "
+            "golden_minute_duration, golden_minute_per_message, rob_success_chance, "
+            "golden_minute_chance, rob_steal_percent, rob_fine_percent"
+        )
+        return
+    key = args[1].lower()
+    if key not in SETTINGS_KEYS:
+        await message.reply(f"Неизвестный ключ. Доступные: {', '.join(SETTINGS_KEYS)}")
+        return
+    _, type_fn, _ = SETTINGS_KEYS[key]
+    try:
+        val = type_fn(args[2])
+    except (ValueError, TypeError):
+        await message.reply(f"Неверный формат. Нужно: {type_fn.__name__}")
+        return
+    set_value(key, val)
+    await message.reply(f"✅ {key} = {val}")
 
 
 # админ начисление
@@ -515,20 +616,25 @@ async def spin(message: types.Message):
 
 
 # Сундук
-CHEST_COOLDOWN = 3600  # 1 час
-CHEST_REWARDS = [(500, 80), (1000, 15), (2000, 5), (100000, 0.0001)]
 chest_available = {}  # chat_id -> message_id (если сундук есть и не взят)
 
 
 def _roll_chest_reward():
+    rewards = get("chest_rewards", DEFAULTS["chest_rewards"])
     r = random.random() * 100
-    if r < 0.0001:
-        return 100000
-    if r < 5:
-        return 2000
-    if r < 20:
-        return 1000
-    return 500
+    cumulative = 0
+    for amount, chance in rewards:
+        cumulative += chance
+        if r < cumulative:
+            return amount
+    return rewards[0][0] if rewards else 500
+
+
+def _is_night() -> bool:
+    """Ночь: 01:00–07:00 по локальному времени сервера."""
+    from datetime import datetime
+    h = datetime.now().hour
+    return 1 <= h < 7
 
 
 @dp.message(Command("chest"))
@@ -548,6 +654,11 @@ async def chest_grab(message: types.Message):
     await db.change_balance(user_id, chat_id, reward)
 
     del chest_available[chat_id]
+    # Планируем следующий сундук через 1–20 минут
+    min_i = get("chest_min_interval", 60)
+    max_i = get("chest_max_interval", 1200)
+    next_spawn = time.time() + random.randint(min_i, max_i)
+    await db.set_next_chest_time(chat_id, next_spawn)
 
     w = mimriks(reward)
     await message.reply(f"🎁 Вы забрали сундук! +{reward} {w}!")
@@ -570,6 +681,10 @@ async def chest_callback(callback: CallbackQuery):
     await db.change_balance(user_id, chat_id, reward)
 
     del chest_available[chat_id]
+    min_i = get("chest_min_interval", 60)
+    max_i = get("chest_max_interval", 1200)
+    next_spawn = time.time() + random.randint(min_i, max_i)
+    await db.set_next_chest_time(chat_id, next_spawn)
 
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
@@ -585,19 +700,29 @@ async def chest_callback(callback: CallbackQuery):
 
 async def chest_spawn_task():
     while True:
-        await asyncio.sleep(300)  # проверка каждые 5 минут
+        await asyncio.sleep(30)  # проверка каждые 30 секунд
         try:
             chat_ids = await db.get_chat_ids_with_users()
         except Exception:
             continue
 
+        now = time.time()
+        if _is_night():
+            continue
+
         for chat_id in chat_ids:
-            last = await db.get_last_chest_time(chat_id)
-            if time.time() - last < CHEST_COOLDOWN:
+            if chat_id in chest_available:
                 continue
-            if random.random() > 0.3:
+            next_spawn = await db.get_next_chest_time(chat_id)
+            if next_spawn is None:
+                # Первый сундук — планируем через 1–20 мин
+                min_i = get("chest_min_interval", 60)
+                max_i = get("chest_max_interval", 1200)
+                next_spawn = now + random.randint(min_i, max_i)
+                await db.set_next_chest_time(chat_id, next_spawn)
                 continue
-            await db.set_chest_spawned(chat_id)
+            if now < next_spawn:
+                continue
             kb = InlineKeyboardBuilder()
             kb.add(InlineKeyboardButton(text="Забрать", callback_data="chest_grab"))
             try:
@@ -612,10 +737,6 @@ async def chest_spawn_task():
 
 
 # Золотая минута
-GOLDEN_DURATION = 60
-GOLDEN_PER_MESSAGE = 10
-
-
 async def golden_minute_task():
     while True:
         await asyncio.sleep(600)  # проверка каждые 10 минут
@@ -629,17 +750,24 @@ async def golden_minute_task():
         for (chat_id,) in rows:
             if chat_id in golden_minute_active:
                 continue
-            if random.random() > 0.15:
+            if random.random() > get("golden_minute_chance", 0.15):
                 continue
 
+            duration = get("golden_minute_duration", 60)
             golden_minute_active[chat_id] = {
-                "end": time.time() + GOLDEN_DURATION,
+                "end": time.time() + duration,
                 "earnings": {},  # user_id -> (amount, username)
             }
             try:
                 await bot.send_message(chat_id, "🌟 В чате началась золотая минута! Пишите сообщения — получайте мимрики!")
             except Exception:
                 golden_minute_active.pop(chat_id, None)
+
+
+# Личка: на любое сообщение — инструкция
+@dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
+async def private_any_message(message: types.Message):
+    await message.reply(_private_instructions())
 
 
 @dp.message(F.text)
@@ -669,15 +797,34 @@ async def on_any_message(message: types.Message):
     if await db.get_balance(user_id, chat_id) is None:
         return
 
+    per_msg = get("golden_minute_per_message", 10)
     prev = state["earnings"].get(user_id, (0, ""))
-    amt = prev[0] + GOLDEN_PER_MESSAGE
+    amt = prev[0] + per_msg
     name = message.from_user.username or message.from_user.first_name or "?"
     state["earnings"][user_id] = (amt, name)
-    await db.change_balance(user_id, chat_id, GOLDEN_PER_MESSAGE)
+    await db.change_balance(user_id, chat_id, per_msg)
+
+
+BOT_COMMANDS = [
+    BotCommand(command="start", description="Приветствие"),
+    BotCommand(command="help", description="Список команд"),
+    BotCommand(command="registration", description="Регистрация (500 мимриков)"),
+    BotCommand(command="balance", description="Баланс"),
+    BotCommand(command="bet", description="Сделать ставку"),
+    BotCommand(command="bank", description="Текущий банк раунда"),
+    BotCommand(command="transfer", description="Перевести мимрики"),
+    BotCommand(command="coinflip", description="50/50: удвоить или проиграть"),
+    BotCommand(command="rob", description="Попытаться украсть мимрики"),
+    BotCommand(command="chest", description="Забрать сундук"),
+    BotCommand(command="leaderboard", description="Топ игроков"),
+    BotCommand(command="addcoins", description="(админ) Начислить мимрики"),
+    BotCommand(command="spin", description="(админ) Запустить рулетку"),
+]
 
 
 async def main():
     await db.init_db()
+    await bot.set_my_commands(BOT_COMMANDS)
     asyncio.create_task(chest_spawn_task())
     asyncio.create_task(golden_minute_task())
     await dp.start_polling(bot)

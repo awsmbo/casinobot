@@ -67,9 +67,15 @@ async def init_db():
         await db.execute("""
         CREATE TABLE IF NOT EXISTS chest_spawns(
             chat_id INTEGER PRIMARY KEY,
-            last_spawn REAL
+            last_spawn REAL,
+            next_spawn REAL
         )
         """)
+        # Миграция: добавить next_spawn если нет
+        cursor = await db.execute("PRAGMA table_info(chest_spawns)")
+        cols = [r[1] for r in await cursor.fetchall()]
+        if "next_spawn" not in cols:
+            await db.execute("ALTER TABLE chest_spawns ADD COLUMN next_spawn REAL")
 
         await db.execute("""
         CREATE TABLE IF NOT EXISTS rob_cooldown(
@@ -243,14 +249,47 @@ async def get_last_chest_time(chat_id):
         return row[0] if row else 0
 
 
+async def get_next_chest_time(chat_id):
+    """Время, когда следующий сундук должен появиться."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT next_spawn FROM chest_spawns WHERE chat_id = ?",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row and row[0] else None
+
+
 async def set_chest_spawned(chat_id):
     import time
 
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO chest_spawns VALUES (?, ?)",
-            (chat_id, time.time()),
+            "INSERT OR REPLACE INTO chest_spawns VALUES (?, ?, ?)",
+            (chat_id, time.time(), None),
         )
+        await db.commit()
+
+
+async def set_next_chest_time(chat_id, next_spawn: float):
+    import time
+
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT last_spawn FROM chest_spawns WHERE chat_id = ?",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        if row:
+            await db.execute(
+                "UPDATE chest_spawns SET next_spawn = ? WHERE chat_id = ?",
+                (next_spawn, chat_id),
+            )
+        else:
+            await db.execute(
+                "INSERT OR REPLACE INTO chest_spawns VALUES (?, ?, ?)",
+                (chat_id, 0, next_spawn),
+            )
         await db.commit()
 
 

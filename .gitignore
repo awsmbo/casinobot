@@ -3,6 +3,7 @@ venv/
 casino.db
 casino.db-shm
 casino.db-wal
+settings.json
 __pycache__/
 *.pyc
 *.pyo
