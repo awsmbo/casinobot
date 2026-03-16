@@ -485,8 +485,8 @@ async def rocket(message: types.Message):
 async def _rocket_flight(chat_id: int, user_id: int):
     """
     Анимация роста множителя от 1.00x до crash_point.
-    Рост по формуле mult(t) = crash_point^(t/T): медленно в начале, быстрее к концу.
-    Обновление сообщения каждые 0.5 с. Длительность раунда T ≈ 2 + crash_point*0.6 сек.
+    Рост по формуле mult(t) = crash_point^((t/T)^p): медленно в начале, быстрее к концу.
+    Обновление сообщения каждые 1 с. Длительность раунда T увеличена для более плавного роста.
     """
     key = (chat_id, user_id)
     state = rocket_games.get(key)
@@ -495,9 +495,11 @@ async def _rocket_flight(chat_id: int, user_id: int):
 
     amount = state["amount"]
     crash_point = state["crash_point"]
-    update_interval = 0.5
-    # Длительность раунда: ~3–8 сек при средних множителях
-    duration = 2.0 + crash_point * 0.6
+    update_interval = 1.0
+    # Длительность раунда: дольше при 1 с тиках — более плавный рост (~4–12 сек)
+    duration = 3.0 + crash_point * 0.9
+    # Показатель плавности роста: >1 даёт более медленный старт
+    p = 1.3
     t = 0.0
 
     while state["active"] and t < duration:
@@ -505,7 +507,8 @@ async def _rocket_flight(chat_id: int, user_id: int):
         t += update_interval
 
         # Текущий множитель: экспонента от 1 до crash_point (медленно в начале, быстрее на больших)
-        current_mult = crash_point ** (t / duration)
+        progress = min(1.0, t / duration)
+        current_mult = crash_point ** (progress**p)
         current_mult = min(current_mult, crash_point)
         current_mult = round(current_mult, 2)
         state["multiplier"] = current_mult
