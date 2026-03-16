@@ -87,6 +87,13 @@ async def init_db():
         )
         """)
 
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS chat_threads(
+            chat_id INTEGER PRIMARY KEY,
+            thread_id INTEGER
+        )
+        """)
+
         if needs_migration:
             for uid, username, balance in old_users:
                 await db.execute(
@@ -336,6 +343,30 @@ async def set_rob_used(user_id, chat_id):
             "INSERT OR REPLACE INTO rob_cooldown VALUES (?, ?, ?)",
             (user_id, chat_id, time.time()),
         )
+        await db.commit()
+
+
+async def get_chat_thread(chat_id: int):
+    """Возвращает разрешённый thread_id для чата или None, если не задан."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT thread_id FROM chat_threads WHERE chat_id = ?",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def set_chat_thread(chat_id: int, thread_id: int | None):
+    """Сохраняет разрешённый thread_id для чата. Если thread_id is None или 0 — снимает ограничение."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        if not thread_id:
+            await db.execute("DELETE FROM chat_threads WHERE chat_id = ?", (chat_id,))
+        else:
+            await db.execute(
+                "INSERT OR REPLACE INTO chat_threads(chat_id, thread_id) VALUES (?, ?)",
+                (chat_id, thread_id),
+            )
         await db.commit()
 
 

@@ -25,6 +25,27 @@ golden_minute_active = {}
 rocket_games = {}
 
 
+async def _thread_allowed(message: types.Message) -> bool:
+    """Возвращает True, если сообщение можно обрабатывать в этом подчате.
+
+    Логика:
+    - Для лички и обычных чатов без тем — всегда True.
+    - Для суперчатов с темами: если для chat_id не задан thread_id — True.
+    - Если задан — только когда message_thread_id совпадает.
+    """
+    if message.chat.type == "private":
+        return True
+
+    # В обычных группах без тем message_thread_id обычно None
+    if message.chat.type in {"group", "supergroup"}:
+        allowed_thread = await db.get_chat_thread(message.chat.id)
+        if not allowed_thread:
+            return True
+        return (getattr(message, "message_thread_id", None) or 0) == allowed_thread
+
+    return True
+
+
 def _build_round_keyboard(chat_id: int, ready_count: int, total: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.add(
@@ -103,6 +124,8 @@ def _private_instructions() -> str:
 # старт
 @dp.message(Command("start"))
 async def start(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     if message.chat.type == "private":
         await message.reply(
             "🎰 Добро пожаловать в казино!\n\n"
@@ -119,6 +142,8 @@ async def start(message: types.Message):
 # помощь
 @dp.message(Command("help"))
 async def help_cmd(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     await message.reply(
         "📋 Команды:\n\n"
         "/registration — зарегистрироваться (500 мимриков)\n"
@@ -137,6 +162,8 @@ async def help_cmd(message: types.Message):
 # регистрация
 @dp.message(Command("registration"))
 async def register(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     chat_id = message.chat.id
     created = await db.register_user(
         message.from_user.id,
@@ -153,6 +180,8 @@ async def register(message: types.Message):
 # баланс
 @dp.message(Command("balance"))
 async def balance(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     bal = await db.get_balance(message.from_user.id, message.chat.id)
 
     if bal is None:
@@ -166,6 +195,8 @@ async def balance(message: types.Message):
 # ставка
 @dp.message(Command("bet"))
 async def bet(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     if not message.from_user:
         return
 
@@ -219,6 +250,8 @@ async def bet(message: types.Message):
 # банк
 @dp.message(Command("bank"))
 async def bank(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     bets = await db.get_all_bets(message.chat.id)
 
     if not bets:
@@ -233,6 +266,8 @@ async def bank(message: types.Message):
 # лидерборд
 @dp.message(Command("leaderboard"))
 async def leaderboard(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     top = await db.get_leaderboard(message.chat.id)
 
     text = "🏆 Топ игроков:\n\n"
@@ -245,6 +280,8 @@ async def leaderboard(message: types.Message):
 # перевод
 @dp.message(Command("transfer"))
 async def transfer(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     args = message.text.split()
     target_text = None
     amount_str = None
@@ -317,6 +354,8 @@ async def transfer(message: types.Message):
 # coinflip
 @dp.message(Command("coinflip"))
 async def coinflip(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     args = message.text.split()
     if len(args) != 2:
         await message.reply("Использование: /coinflip <сумма>")
@@ -361,6 +400,8 @@ async def coinflip(message: types.Message):
 
 @dp.message(Command("rocket"))
 async def rocket(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     args = (message.text or "").split()
     if len(args) != 2:
         await message.reply("Использование: /rocket <сумма>")
@@ -512,9 +553,36 @@ async def rocket_stop_callback(callback: CallbackQuery):
 
     await callback.answer(f"Вы забрали {win} {mimriks(win)}!")
 
+def _get_rob_target(message: types.Message, chat_id: int):
+    """Определяет цель для /rob: по реплаю, по entity (text_mention/mention) или по аргументу @username.
+    Возвращает (target_id или None, нужно ли искать по username в БД).
+    """
+    if message.reply_to_message and message.reply_to_message.from_user:
+        return message.reply_to_message.from_user.id, False
+
+    text = (message.text or "").strip()
+    for entity in (message.entities or []):
+        if entity.type == "text_mention" and getattr(entity, "user", None):
+            return entity.user.id, False
+        if entity.type == "mention":
+            part = text[entity.offset : entity.offset + entity.length]
+            username = (part or "").lstrip("@").strip().lower()
+            if username:
+                return None, (chat_id, username)
+
+    args = text.split()
+    if len(args) >= 2 and args[1].startswith("@"):
+        username = args[1][1:].strip().lower()
+        if username:
+            return None, (chat_id, username)
+    return None, None
+
+
 # rob
 @dp.message(Command("rob"))
 async def rob(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     chat_id = message.chat.id
     user_id = message.from_user.id
 
@@ -523,14 +591,10 @@ async def rob(message: types.Message):
         await message.reply("Сначала /registration")
         return
 
-    target_id = None
-    if message.reply_to_message and message.reply_to_message.from_user:
-        target_id = message.reply_to_message.from_user.id
-    else:
-        args = message.text.split()
-        if len(args) >= 2 and args[1].startswith("@"):
-            username = args[1][1:].lower()
-            target_id = await db.get_user_id_by_username(chat_id, username)
+    target_id, by_username = _get_rob_target(message, chat_id)
+    if target_id is None and isinstance(by_username, tuple):
+        _chat_id, username = by_username
+        target_id = await db.get_user_id_by_username(_chat_id, username)
 
     if target_id is None:
         await message.reply("Использование: /rob @username или реплай на сообщение")
@@ -643,6 +707,52 @@ async def set_cmd(message: types.Message):
     await message.reply(f"✅ {key} = {val}")
 
 
+@dp.message(Command("set_thread"))
+async def set_thread_cmd(message: types.Message):
+    """Установка разрешённого thread_id для чата.
+
+    Использование (только в личке с админом бота):
+    /set_thread <chat_id> <thread_id>
+    Передать 0 вместо thread_id, чтобы снять ограничение для чата.
+    """
+    if message.from_user.id != ADMIN_ID or message.chat.type != "private":
+        return
+
+    args = message.text.split()
+    if len(args) != 3:
+        await message.reply(
+            "Использование: /set_thread <chat_id> <thread_id>\n"
+            "chat_id можно узнать командой /debug_thread в нужном подчате.\n"
+            "Укажите thread_id=0, чтобы снять ограничение."
+        )
+        return
+
+    try:
+        chat_id = int(args[1])
+        thread_id = int(args[2])
+    except ValueError:
+        await message.reply("chat_id и thread_id должны быть числами.")
+        return
+
+    # Проверяем, что админ действительно админ в этом чате
+    try:
+        member = await bot.get_chat_member(chat_id, message.from_user.id)
+    except Exception:
+        await message.reply("Не удалось получить информацию о чате. Бот должен быть добавлен в этот чат.")
+        return
+
+    if member.status not in ("administrator", "creator"):
+        await message.reply("Вы не являетесь администратором указанного чата.")
+        return
+
+    await db.set_chat_thread(chat_id, thread_id or None)
+
+    if thread_id:
+        await message.reply(f"✅ Для чата {chat_id} установлен thread_id = {thread_id}.")
+    else:
+        await message.reply(f"✅ Ограничение по thread_id для чата {chat_id} снято.")
+
+
 # админ начисление
 @dp.message(Command("addcoins"))
 async def addcoins(message: types.Message):
@@ -746,6 +856,8 @@ async def _do_spin(chat_id: int, msg_to_edit: types.Message):
 # запуск колеса (админ)
 @dp.message(Command("spin"))
 async def spin(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -805,6 +917,8 @@ def _is_night() -> bool:
 
 @dp.message(Command("chest"))
 async def chest_grab(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     chat_id = message.chat.id
     user_id = message.from_user.id
 
@@ -940,6 +1054,8 @@ async def debug_thread(message: types.Message):
 
 @dp.message(F.text)
 async def on_any_message(message: types.Message):
+    if not await _thread_allowed(message):
+        return
     chat_id = message.chat.id
     if chat_id not in golden_minute_active:
         return
