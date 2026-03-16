@@ -24,6 +24,9 @@ golden_minute_active = {}
 # Rocket: (chat_id, user_id) -> {"amount": int, "multiplier": float, "active": bool, "message_id": int}
 rocket_games = {}
 
+# Roulette: chat_id -> {"active": bool, "end_ts": float, "message_id": int, "bets": [...]}
+roulette_rounds = {}
+
 
 async def _thread_allowed(message: types.Message) -> bool:
     """Возвращает True, если сообщение можно обрабатывать в этом подчате.
@@ -398,6 +401,298 @@ async def coinflip(message: types.Message):
         f"Ваш баланс: {bal} {mimriks(bal)}")
 
 
+async def _roulette_round_runner(chat_id: int):
+    """Запускает таймер раунда рулетки, принимает ставки 60 секунд и затем крутит рулетку."""
+    state = roulette_rounds.get(chat_id)
+    if not state or not state.get("active"):
+        return
+
+    end_ts = state["end_ts"]
+    # Ждём до конца приёма ставок
+    while True:
+        now = time.time()
+        if now >= end_ts:
+            break
+        # Обновляем сообщение раз в несколько секунд (без агрессивного спама)
+        left = int(end_ts - now)
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=state["message_id"],
+                text=(
+                    "🎰 Рулетка запущена!\n"
+                    f"До конца приёма ставок: ~{left} сек.\n\n"
+                    "Делайте ставку командой:\n"
+                    "/roulette <ставка> <цвет/число>\n"
+                    "Примеры: /roulette 10 red, /roulette 25 17, /roulette 50 green"
+                ),
+            )
+        except Exception:
+            # Если сообщение удалить или нельзя обновить — просто продолжаем таймер
+            pass
+
+        # Обновляем не чаще раза в 5 секунд
+        await asyncio.sleep(5)
+
+    # Фиксируем состояние ещё раз
+    state = roulette_rounds.get(chat_id)
+    if not state or not state.get("active"):
+        return
+
+    state["active"] = False
+    bets = state.get("bets") or []
+
+    # Если ставок нет — просто сообщаем и выходим
+    if not bets:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=state["message_id"],
+                text="🎰 Рулетка завершена.\nНи одной ставки не было сделано.",
+            )
+        except Exception:
+            try:
+                await bot.send_message(chat_id, "🎰 Рулетка завершена. Ставок не было.")
+            except Exception:
+                pass
+        return
+
+    # Крутим рулетку
+    spin = random.randint(0, 36)
+    if spin == 0:
+        spin_color = "green"
+    elif spin % 2 == 0:
+        spin_color = "black"
+    else:
+        spin_color = "red"
+
+    color_map = {
+        "red": "🔴 красное",
+        "black": "⚫ чёрное",
+        "green": "🟢 зелёное (0)",
+    }
+    spin_text = color_map.get(spin_color, spin_color)
+
+    # Обрабатываем ставки
+    results_lines = [
+        f"🎰 Рулетка завершена!\n"
+        f"Выпало: {spin} ({spin_text})\n"
+        f"Результаты ставок:\n"
+    ]
+
+    # Для краткости собираем по пользователю суммарный выигрыш
+    user_wins: dict[int, int] = {}
+
+    for bet in bets:
+        uid = bet["user_id"]
+        amount = bet["amount"]
+        bet_type = bet["bet_type"]
+        bet_color = bet["bet_color"]
+        bet_number = bet["bet_number"]
+
+        win = 0
+        reason = ""
+
+        if bet_type == "color":
+            if bet_color == spin_color:
+                if bet_color in {"red", "black"}:
+                    win = amount * 2
+                else:  # green
+                    win = amount * 14
+                reason = "угадал цвет"
+            else:
+                win = 0
+                reason = "не угадал цвет"
+        else:  # number
+            if bet_number == spin:
+                win = amount * 36
+                reason = "угадал число"
+            else:
+                win = 0
+                reason = "не угадал число"
+
+        if win > 0:
+            await db.change_balance(uid, chat_id, win)
+            user_wins[uid] = user_wins.get(uid, 0) + win
+
+        # Формируем описание бета
+        if bet_type == "color":
+            bet_desc = color_map.get(bet_color, bet_color)
+        else:
+            bet_desc = f"число {bet_number}"
+
+        results_lines.append(
+            f"- Игрок {uid}: ставка {amount} на {bet_desc} — {reason}"
+            + (f", выигрыш {win}" if win > 0 else "")
+        )
+
+    # Отправляем сводку в чат
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=state["message_id"],
+            text="\n".join(results_lines),
+        )
+    except Exception:
+        try:
+            await bot.send_message(chat_id, "\n".join(results_lines))
+        except Exception:
+            pass
+
+@dp.message(Command("roulette"))
+async def roulette(message: types.Message):
+    """
+    Многопользовательская рулетка с минутой на ставки.
+    Форматы:
+      /roulette                — запустить раунд рулетки в чате (если ещё не идёт)
+      /roulette <ставка> <бет> — сделать ставку в текущем раунде
+
+    Где <бет>:
+      - red / красное          — ставка на красное (2x)
+      - black / чёрное         — ставка на чёрное (2x)
+      - green / зелёное / 0    — ставка на зелёное (0) (14x)
+      - число 0–36             — ставка на конкретное число (36x)
+    """
+    if not await _thread_allowed(message):
+        return
+
+    args = (message.text or "").split()
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    # Глобальное состояние рулетки (по чату)
+    global roulette_rounds
+
+    # 1) Старт раунда: /roulette
+    if len(args) == 1:
+        state = roulette_rounds.get(chat_id)
+        now = time.time()
+        if state and state.get("active") and state.get("end_ts", 0) > now:
+            left = int(state["end_ts"] - now)
+            await message.reply(f"🎰 Рулетка уже запущена! До конца приёма ставок ~{left} сек.\n"
+                               f"Ставка: /roulette <сумма> <цвет/число>")
+            return
+
+        end_ts = now + 60
+        text = (
+            "🎰 Рулетка запущена!\n"
+            "У вас есть 60 секунд, чтобы сделать ставки.\n\n"
+            "Делайте ставку командой:\n"
+            "/roulette <ставка> <цвет/число>\n"
+            "Примеры: /roulette 10 red, /roulette 25 17, /roulette 50 green"
+        )
+        msg = await message.reply(text)
+
+        roulette_rounds[chat_id] = {
+            "active": True,
+            "end_ts": end_ts,
+            "message_id": msg.message_id,
+            "bets": [],  # список словарей: {user_id, amount, bet_type, bet_color, bet_number}
+        }
+
+        asyncio.create_task(_roulette_round_runner(chat_id))
+        return
+
+    # 2) Ставка: /roulette <ставка> <бет>
+    if len(args) != 3:
+        await message.reply(
+            "Использование:\n"
+            "/roulette — запустить раунд\n"
+            "/roulette <ставка> <цвет/число> — сделать ставку в текущем раунде"
+        )
+        return
+
+    state = roulette_rounds.get(chat_id)
+    now = time.time()
+    if not state or not state.get("active") or state.get("end_ts", 0) <= now:
+        await message.reply("Сейчас нет активного раунда рулетки. Сначала запустите /roulette.")
+        return
+
+    try:
+        amount = int(args[1])
+    except ValueError:
+        await message.reply("Ставка должна быть числом.")
+        return
+
+    if amount < 1:
+        await message.reply("Минимальная ставка — 1 мимрик.")
+        return
+
+    bet_raw = args[2].strip().lower()
+
+    bal = await db.get_balance(user_id, chat_id)
+    if bal is None:
+        await message.reply("Сначала /registration")
+        return
+
+    if amount > bal:
+        await message.reply(f"Недостаточно {mimriks(amount)}.")
+        return
+
+    # Списываем ставку
+    await db.change_balance(user_id, chat_id, -amount)
+
+    # Определяем тип ставки
+    bet_type = None  # 'color' или 'number'
+    bet_color = None  # 'red' / 'black' / 'green'
+    bet_number = None
+
+    # Маппинг для цветов
+    if bet_raw in {"red", "красное", "красный"}:
+        bet_type = "color"
+        bet_color = "red"
+    elif bet_raw in {"black", "чёрное", "черное", "чёрный", "черный"}:
+        bet_type = "color"
+        bet_color = "black"
+    elif bet_raw in {"green", "зелёное", "зеленое", "зелёный", "зеленый", "0"}:
+        bet_type = "color"
+        bet_color = "green"
+    else:
+        # Пытаемся интерпретировать как число 0–36
+        try:
+            n = int(bet_raw)
+        except ValueError:
+            await message.reply("Неверный тип ставки. Укажите цвет (red/black/green) или число 0–36.")
+            # Возвращаем ставку
+            await db.change_balance(user_id, chat_id, amount)
+            return
+
+        if not (0 <= n <= 36):
+            await message.reply("Число должно быть от 0 до 36.")
+            await db.change_balance(user_id, chat_id, amount)
+            return
+
+        bet_type = "number"
+        bet_number = n
+
+    # Сохраняем ставку в состояние раунда
+    state["bets"].append(
+        {
+            "user_id": user_id,
+            "amount": amount,
+            "bet_type": bet_type,
+            "bet_color": bet_color,
+            "bet_number": bet_number,
+        }
+    )
+
+    bet_desc: str
+    color_map = {
+        "red": "🔴 красное",
+        "black": "⚫ чёрное",
+        "green": "🟢 зелёное (0)",
+    }
+    if bet_type == "color":
+        bet_desc = color_map.get(bet_color, bet_color)
+    else:
+        bet_desc = f"число {bet_number}"
+
+    await message.reply(
+        f"✅ Ваша ставка принята!\n"
+        f"Ставка: {amount} {mimriks(amount)} на {bet_desc}.\n"
+        f"Результат будет после окончания раунда."
+    )
+
 # --- Ракета: формула распределения и логика роста ---
 # Распределение множителя краша:
 #   r ~ U(0, 1) (равномерно от 0 до 1), multiplier = 1 / (1 - r), макс 10.00.
@@ -424,62 +719,8 @@ def _generate_crash_multiplier() -> float:
 
 @dp.message(Command("rocket"))
 async def rocket(message: types.Message):
-    if not await _thread_allowed(message):
-        return
-    args = (message.text or "").split()
-    if len(args) != 2:
-        await message.reply("Использование: /rocket <сумма>")
-        return
-
-    try:
-        amount = int(args[1])
-    except ValueError:
-        await message.reply("Сумма должна быть числом.")
-        return
-
-    if amount < 1:
-        await message.reply("Минимальная ставка — 1 мимрик.")
-        return
-
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-
-    if (chat_id, user_id) in rocket_games and rocket_games[(chat_id, user_id)]["active"]:
-        await message.reply("У вас уже запущена ракета. Дождитесь окончания игры.")
-        return
-
-    bal = await db.get_balance(user_id, chat_id)
-    if bal is None:
-        await message.reply("Сначала /registration")
-        return
-
-    if amount > bal:
-        await message.reply(f"Недостаточно {mimriks(amount)}.")
-        return
-
-    await db.change_balance(user_id, chat_id, -amount)
-
-    crash_point = _generate_crash_multiplier()
-
-    kb = InlineKeyboardBuilder()
-    kb.add(InlineKeyboardButton(text="Забрать", callback_data="rocket_stop"))
-
-    msg = await message.reply(
-        f"🚀 Ракета взлетает!\n"
-        f"Ставка: {amount} {mimriks(amount)}\n"
-        f"Множитель: 1.00x",
-        reply_markup=kb.as_markup(),
-    )
-
-    rocket_games[(chat_id, user_id)] = {
-        "amount": amount,
-        "multiplier": 1.0,
-        "active": True,
-        "message_id": msg.message_id,
-        "crash_point": crash_point,
-    }
-
-    asyncio.create_task(_rocket_flight(chat_id, user_id))
+    await message.reply("🚀 Игра с ракетой временно отключена для доработки.")
+    return
 
 
 async def _rocket_flight(chat_id: int, user_id: int):
@@ -558,35 +799,7 @@ async def _rocket_flight(chat_id: int, user_id: int):
 
 @dp.callback_query(F.data == "rocket_stop")
 async def rocket_stop_callback(callback: CallbackQuery):
-    chat_id = callback.message.chat.id
-    user_id = callback.from_user.id
-    key = (chat_id, user_id)
-
-    state = rocket_games.get(key)
-    if not state or not state.get("active"):
-        await callback.answer("Игра уже завершена.", show_alert=True)
-        return
-
-    state["active"] = False
-    amount = state["amount"]
-    multiplier = state["multiplier"]
-    win = int(amount * multiplier)
-
-    await db.change_balance(user_id, chat_id, win)
-
-    text = (
-        "🚀 Ракета взлетает!\n"
-        f"Ставка: {amount} {mimriks(amount)}\n"
-        f"Множитель: {multiplier:.2f}x\n\n"
-        f"🛑 Вы нажали «Забрать» и выиграли {win} {mimriks(win)}!"
-    )
-
-    try:
-        await callback.message.edit_text(text, reply_markup=None)
-    except Exception:
-        pass
-
-    await callback.answer(f"Вы забрали {win} {mimriks(win)}!")
+    await callback.answer("Игра с ракетой временно отключена.", show_alert=True)
 
 def _extract_utf16(text: str, offset: int, length: int) -> str:
     """Извлекает подстроку по offset и length в единицах UTF-16 (как в Telegram API)."""
@@ -1160,7 +1373,8 @@ BOT_COMMANDS = [
     BotCommand(command="bank", description="Текущий банк раунда"),
     BotCommand(command="transfer", description="Перевести мимрики"),
     BotCommand(command="coinflip", description="50/50: удвоить или проиграть"),
-    BotCommand(command="rocket", description="Ракета с растущим множителем"),
+    BotCommand(command="rocket", description="Ракета (временно отключена)"),
+    BotCommand(command="roulette", description="Рулетка: цвета и числа"),
     BotCommand(command="rob", description="Попытаться украсть мимрики"),
     BotCommand(command="chest", description="Забрать сундук"),
     BotCommand(command="leaderboard", description="Топ игроков"),
