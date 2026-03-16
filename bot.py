@@ -21,6 +21,9 @@ round_messages_cache = {}
 # Золотая минута: {chat_id: {"end": ts, "earnings": {user_id: amount}}}
 golden_minute_active = {}
 
+# Rocket: (chat_id, user_id) -> {"amount": int, "multiplier": float, "active": bool, "message_id": int}
+rocket_games = {}
+
 
 def _build_round_keyboard(chat_id: int, ready_count: int, total: int) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
@@ -124,6 +127,7 @@ async def help_cmd(message: types.Message):
         "/bank — текущий банк раунда\n"
         "/transfer @user <сумма> — передать мимрики другому игроку\n"
         "/coinflip <сумма> — 50/50: проиграть или удвоить\n"
+        "/rocket <сумма> — игра с растущим множителем и риском взрыва\n"
         "/rob @user — попытаться украсть мимрики (10% шанс, 1 раз в 30 мин)\n"
         "/leaderboard — топ игроков\n"
         "Сундуки и золотая минута появляются случайно в чате!"
@@ -355,19 +359,167 @@ async def coinflip(message: types.Message):
         f"Ваш баланс: {bal} {mimriks(bal)}")
 
 
-# rob
-@dp.message(Command("rob"))
-async def rob(message: types.Message):
-    bal = await db.get_balance(message.from_user.id, message.chat.id)
-    if bal is None:
-        await message.reply("Сначала /registration")
+@dp.message(Command("rocket"))
+async def rocket(message: types.Message):
+    args = (message.text or "").split()
+    if len(args) != 2:
+        await message.reply("Использование: /rocket <сумма>")
         return
-    
+
+    try:
+        amount = int(args[1])
+    except ValueError:
+        await message.reply("Сумма должна быть числом.")
+        return
+
+    if amount < 1:
+        await message.reply("Минимальная ставка — 1 мимрик.")
+        return
+
     chat_id = message.chat.id
     user_id = message.from_user.id
 
-    rob_bal = await db.get_balance(user_id, chat_id)
-    if rob_bal is None:
+    if (chat_id, user_id) in rocket_games and rocket_games[(chat_id, user_id)]["active"]:
+        await message.reply("У вас уже запущена ракета. Дождитесь окончания игры.")
+        return
+
+    bal = await db.get_balance(user_id, chat_id)
+    if bal is None:
+        await message.reply("Сначала /registration")
+        return
+
+    if amount > bal:
+        await message.reply(f"Недостаточно {mimriks(amount)}.")
+        return
+
+    await db.change_balance(user_id, chat_id, -amount)
+
+    kb = InlineKeyboardBuilder()
+    kb.add(InlineKeyboardButton(text="Стоп", callback_data="rocket_stop"))
+
+    msg = await message.reply(
+        f"🚀 Ракета взлетает!\n"
+        f"Ставка: {amount} {mimriks(amount)}\n"
+        f"Множитель: 1.00x",
+        reply_markup=kb.as_markup(),
+    )
+
+    rocket_games[(chat_id, user_id)] = {
+        "amount": amount,
+        "multiplier": 1.0,
+        "active": True,
+        "message_id": msg.message_id,
+    }
+
+    asyncio.create_task(_rocket_flight(chat_id, user_id))
+
+
+async def _rocket_flight(chat_id: int, user_id: int):
+    key = (chat_id, user_id)
+    state = rocket_games.get(key)
+    if not state or not state["active"]:
+        return
+
+    amount = state["amount"]
+    multiplier = state["multiplier"]
+
+    while state["active"] and multiplier < 10.0:
+        await asyncio.sleep(0.6)
+
+        # Ускоряющийся рост множителя
+        step = 0.01 + (multiplier - 1.0) * 0.08
+        multiplier = min(10.0, multiplier + step)
+        state["multiplier"] = multiplier
+
+        # Вероятность падения растёт с множителем: ~5% около 1.01x, почти 100% около 10x
+        crash_prob = min(0.99, 0.05 + (multiplier - 1.0) * 0.2)
+
+        if random.random() < crash_prob:
+            state["active"] = False
+            text = (
+                "🚀 Ракета взлетает!\n"
+                f"Ставка: {amount} {mimriks(amount)}\n"
+                f"Множитель: {multiplier:.2f}x\n\n"
+                "💥 Ракета взорвалась! Ставка проиграна."
+            )
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=state["message_id"],
+                    text=text,
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+            break
+
+        # Обновляем сообщение с текущим множителем
+        text = (
+            "🚀 Ракета взлетает!\n"
+            f"Ставка: {amount} {mimriks(amount)}\n"
+            f"Множитель: {multiplier:.2f}x\n\n"
+            "Нажмите «Стоп», чтобы зафиксировать выигрыш."
+        )
+        try:
+            kb = InlineKeyboardBuilder()
+            kb.add(InlineKeyboardButton(text="Стоп", callback_data="rocket_stop"))
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=state["message_id"],
+                text=text,
+                reply_markup=kb.as_markup(),
+            )
+        except Exception:
+            # Если не удалось обновить сообщение (удалено/редактировано) — останавливаем игру
+            state["active"] = False
+            break
+
+    # Если достигнут максимум и ракета всё ещё активна — не взорвалась автоматически
+    if state.get("active") and multiplier >= 10.0:
+        # Оставляем игроку шанс нажать «Стоп» на 10x, пока не упадёт по следующему тику
+        pass
+
+
+@dp.callback_query(F.data == "rocket_stop")
+async def rocket_stop_callback(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    key = (chat_id, user_id)
+
+    state = rocket_games.get(key)
+    if not state or not state.get("active"):
+        await callback.answer("Игра уже завершена.", show_alert=True)
+        return
+
+    state["active"] = False
+    amount = state["amount"]
+    multiplier = state["multiplier"]
+    win = int(amount * multiplier)
+
+    await db.change_balance(user_id, chat_id, win)
+
+    text = (
+        "🚀 Ракета взлетает!\n"
+        f"Ставка: {amount} {mimriks(amount)}\n"
+        f"Множитель: {multiplier:.2f}x\n\n"
+        f"🛑 Вы нажали «Стоп» и выиграли {win} {mimriks(win)}!"
+    )
+
+    try:
+        await callback.message.edit_text(text, reply_markup=None)
+    except Exception:
+        pass
+
+    await callback.answer(f"Вы забрали {win} {mimriks(win)}!")
+
+# rob
+@dp.message(Command("rob"))
+async def rob(message: types.Message):
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+
+    bal = await db.get_balance(user_id, chat_id)
+    if bal is None:
         await message.reply("Сначала /registration")
         return
 
@@ -402,7 +554,11 @@ async def rob(message: types.Message):
     if time.time() - last_rob < rob_cooldown:
         left = int(rob_cooldown - (time.time() - last_rob))
         m = left // 60
-        await message.reply(f"⏳ Кража возможна раз в {rob_cooldown // 60} минут. Подождите ещё {m} мин.")
+        s = left % 60
+        await message.reply(
+            f"⏳ Кража возможна раз в {rob_cooldown // 60} минут.\n"
+            f"Подождите ещё {m} мин {s} сек."
+        )
         return
 
     await db.set_rob_used(user_id, chat_id)
@@ -414,7 +570,7 @@ async def rob(message: types.Message):
     if random.random() > rob_success:
         # Провал — штраф
         fine_amount = max(1, int(bal * fine_pct))
-        fine_amount = min(fine_amount, rob_bal)
+        fine_amount = min(fine_amount, bal)
         if fine_amount > 0:
             await db.change_balance(user_id, chat_id, -fine_amount)
             w = mimriks(fine_amount)
@@ -717,9 +873,6 @@ async def chest_spawn_task():
             continue
 
         now = time.time()
-        if _is_night():
-            continue
-
         for chat_id in chat_ids:
             if chat_id in chest_available:
                 continue
@@ -778,6 +931,13 @@ async def private_any_message(message: types.Message):
     await message.reply(_private_instructions())
 
 
+@dp.message(Command("debug_thread"))
+async def debug_thread(message: types.Message):
+    await message.reply(
+        f"chat_id={message.chat.id}, thread_id={getattr(message, 'message_thread_id', None)}"
+    )
+
+
 @dp.message(F.text)
 async def on_any_message(message: types.Message):
     chat_id = message.chat.id
@@ -822,6 +982,7 @@ BOT_COMMANDS = [
     BotCommand(command="bank", description="Текущий банк раунда"),
     BotCommand(command="transfer", description="Перевести мимрики"),
     BotCommand(command="coinflip", description="50/50: удвоить или проиграть"),
+    BotCommand(command="rocket", description="Ракета с растущим множителем"),
     BotCommand(command="rob", description="Попытаться украсть мимрики"),
     BotCommand(command="chest", description="Забрать сундук"),
     BotCommand(command="leaderboard", description="Топ игроков"),
