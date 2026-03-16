@@ -445,16 +445,9 @@ async def _roulette_round_runner(chat_id: int):
     # Если ставок нет — просто сообщаем и выходим
     if not bets:
         try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=state["message_id"],
-                text="🎰 Рулетка завершена.\nНи одной ставки не было сделано.",
-            )
+            await bot.send_message(chat_id, "🎰 Рулетка завершена.\nНи одной ставки не было сделано.")
         except Exception:
-            try:
-                await bot.send_message(chat_id, "🎰 Рулетка завершена. Ставок не было.")
-            except Exception:
-                pass
+            pass
         return
 
     # Крутим рулетку
@@ -515,6 +508,17 @@ async def _roulette_round_runner(chat_id: int):
             await db.change_balance(uid, chat_id, win)
             user_wins[uid] = user_wins.get(uid, 0) + win
 
+        # Получаем отображаемое имя пользователя
+        try:
+            member = await bot.get_chat_member(chat_id, uid)
+            user = member.user
+            if user.username:
+                user_name = f"@{user.username}"
+            else:
+                user_name = user.full_name
+        except Exception:
+            user_name = f"id {uid}"
+
         # Формируем описание бета
         if bet_type == "color":
             bet_desc = color_map.get(bet_color, bet_color)
@@ -522,22 +526,15 @@ async def _roulette_round_runner(chat_id: int):
             bet_desc = f"число {bet_number}"
 
         results_lines.append(
-            f"- Игрок {uid}: ставка {amount} на {bet_desc} — {reason}"
+            f"- {user_name}: ставка {amount} на {bet_desc} — {reason}"
             + (f", выигрыш {win}" if win > 0 else "")
         )
 
-    # Отправляем сводку в чат
+    # Отправляем сводку в чат отдельным сообщением
     try:
-        await bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=state["message_id"],
-            text="\n".join(results_lines),
-        )
+        await bot.send_message(chat_id, "\n".join(results_lines))
     except Exception:
-        try:
-            await bot.send_message(chat_id, "\n".join(results_lines))
-        except Exception:
-            pass
+        pass
 
 @dp.message(Command("roulette"))
 async def roulette(message: types.Message):
