@@ -69,33 +69,24 @@ def _format_bets_text(bets: list, total: int, prefix: str = "") -> str:
 
 
 async def _update_or_send_round_message(chat_id: int, text: str, reply_to_message=None) -> int:
-    """Обновляет или отправляет сообщение раунда. Возвращает message_id."""
+    """Отправляет новое сообщение раунда и снимает кнопки со старого. Возвращает message_id нового сообщения."""
     ready_count = await db.get_round_ready_count(chat_id)
     bets = await db.get_all_bets(chat_id)
     total_participants = len(bets)
     kb = _build_round_keyboard(chat_id, ready_count, total_participants)
 
     msg_id = await db.get_round_message(chat_id)
+    # Если есть предыдущее сообщение раунда — убираем у него кнопки
     if msg_id:
         try:
-            await bot.edit_message_text(
+            await bot.edit_message_reply_markup(
                 chat_id=chat_id,
                 message_id=msg_id,
-                text=text,
-                reply_markup=kb,
+                reply_markup=None,
             )
-            return msg_id
         except Exception:
-            # Убираем кнопку с предыдущего сообщения перед отправкой нового
-            try:
-                await bot.edit_message_reply_markup(
-                    chat_id=chat_id,
-                    message_id=msg_id,
-                    reply_markup=None,
-                )
-            except Exception:
-                pass
-            await db.clear_round_message(chat_id)
+            # Если не смогли снять клавиатуру — просто продолжаем, не падаем
+            pass
 
     # Если для чата задан обязательный thread_id — всегда отвечаем туда
     message_thread_id = None
