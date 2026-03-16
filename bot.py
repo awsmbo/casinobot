@@ -398,6 +398,30 @@ async def coinflip(message: types.Message):
         f"Ваш баланс: {bal} {mimriks(bal)}")
 
 
+# --- Ракета: формула распределения и логика роста ---
+# Распределение множителя краша:
+#   r ~ U(0, 1) (равномерно от 0 до 1), multiplier = 1 / (1 - r), макс 10.00.
+#   P(multiplier <= x) = P(1/(1-r) <= x) = P(r <= 1 - 1/x) = 1 - 1/x  при x >= 1.
+#   Плотность: f(x) = 1/x^2 при x >= 1 — тяжёлый хвост (малые x частые, большие редкие).
+#   Ожидаемое распределение: 1–1.2x очень часто, 1.2–2 часто, 2–3 иногда, 3–5 редко, 5–10 очень редко.
+# Рост коэффициента на экране:
+#   mult(t) = crash_point^(t/T), t от 0 до T. При t=0 mult=1, при t=T mult=crash_point.
+#   Производная растёт с t → визуально медленно в начале, быстрее на больших множителях.
+#   T = 2 + crash_point*0.6 сек, обновление каждые 0.5 с → раунд ~3–8 сек при средних множителях.
+
+
+def _generate_crash_multiplier() -> float:
+    """
+    Генерирует множитель краша по модели crash-игр (Bustabit/Stake).
+    r ~ U(0, 1) → multiplier = 1/(1-r), ограничен 10.00x, округление до 2 знаков.
+    Распределение с тяжёлым хвостом: малые множители частые, большие редкие.
+    """
+    r = random.random()  # [0, 1)
+    if r >= 0.9999:
+        r = 0.9999
+    return round(min(10.0, 1.0 / (1.0 - r)), 2)
+
+
 @dp.message(Command("rocket"))
 async def rocket(message: types.Message):
     if not await _thread_allowed(message):
@@ -435,8 +459,10 @@ async def rocket(message: types.Message):
 
     await db.change_balance(user_id, chat_id, -amount)
 
+    crash_point = _generate_crash_multiplier()
+
     kb = InlineKeyboardBuilder()
-    kb.add(InlineKeyboardButton(text="Стоп", callback_data="rocket_stop"))
+    kb.add(InlineKeyboardButton(text="Забрать", callback_data="rocket_stop"))
 
     msg = await message.reply(
         f"🚀 Ракета взлетает!\n"
@@ -450,37 +476,47 @@ async def rocket(message: types.Message):
         "multiplier": 1.0,
         "active": True,
         "message_id": msg.message_id,
+        "crash_point": crash_point,
     }
 
     asyncio.create_task(_rocket_flight(chat_id, user_id))
 
 
 async def _rocket_flight(chat_id: int, user_id: int):
+    """
+    Анимация роста множителя от 1.00x до crash_point.
+    Рост по формуле mult(t) = crash_point^(t/T): медленно в начале, быстрее к концу.
+    Обновление сообщения каждые 0.5 с. Длительность раунда T ≈ 2 + crash_point*0.6 сек.
+    """
     key = (chat_id, user_id)
     state = rocket_games.get(key)
     if not state or not state["active"]:
         return
 
     amount = state["amount"]
-    multiplier = state["multiplier"]
+    crash_point = state["crash_point"]
+    update_interval = 0.5
+    # Длительность раунда: ~3–8 сек при средних множителях
+    duration = 2.0 + crash_point * 0.6
+    t = 0.0
 
-    while state["active"] and multiplier < 10.0:
-        await asyncio.sleep(0.6)
+    while state["active"] and t < duration:
+        await asyncio.sleep(update_interval)
+        t += update_interval
 
-        # Ускоряющийся рост множителя
-        step = 0.01 + (multiplier - 1.0) * 0.08
-        multiplier = min(10.0, multiplier + step)
-        state["multiplier"] = multiplier
+        # Текущий множитель: экспонента от 1 до crash_point (медленно в начале, быстрее на больших)
+        current_mult = crash_point ** (t / duration)
+        current_mult = min(current_mult, crash_point)
+        current_mult = round(current_mult, 2)
+        state["multiplier"] = current_mult
 
-        # Вероятность падения растёт с множителем: ~5% около 1.01x, почти 100% около 10x
-        crash_prob = min(0.99, 0.05 + (multiplier - 1.0) * 0.2)
-
-        if random.random() < crash_prob:
+        # Краш: мы достигли момента краша по времени
+        if t >= duration:
             state["active"] = False
             text = (
                 "🚀 Ракета взлетает!\n"
                 f"Ставка: {amount} {mimriks(amount)}\n"
-                f"Множитель: {multiplier:.2f}x\n\n"
+                f"Множитель: {crash_point:.2f}x\n\n"
                 "💥 Ракета взорвалась! Ставка проиграна."
             )
             try:
@@ -492,18 +528,18 @@ async def _rocket_flight(chat_id: int, user_id: int):
                 )
             except Exception:
                 pass
-            break
+            return
 
         # Обновляем сообщение с текущим множителем
         text = (
             "🚀 Ракета взлетает!\n"
             f"Ставка: {amount} {mimriks(amount)}\n"
-            f"Множитель: {multiplier:.2f}x\n\n"
-            "Нажмите «Стоп», чтобы зафиксировать выигрыш."
+            f"Множитель: {current_mult:.2f}x\n\n"
+            "Нажмите «Забрать», чтобы зафиксировать выигрыш."
         )
         try:
             kb = InlineKeyboardBuilder()
-            kb.add(InlineKeyboardButton(text="Стоп", callback_data="rocket_stop"))
+            kb.add(InlineKeyboardButton(text="Забрать", callback_data="rocket_stop"))
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=state["message_id"],
@@ -511,14 +547,10 @@ async def _rocket_flight(chat_id: int, user_id: int):
                 reply_markup=kb.as_markup(),
             )
         except Exception:
-            # Если не удалось обновить сообщение (удалено/редактировано) — останавливаем игру
             state["active"] = False
-            break
+            return
 
-    # Если достигнут максимум и ракета всё ещё активна — не взорвалась автоматически
-    if state.get("active") and multiplier >= 10.0:
-        # Оставляем игроку шанс нажать «Стоп» на 10x, пока не упадёт по следующему тику
-        pass
+    # Раунд закончился по таймауту без краша (игрок уже забрал или ошибка)
 
 
 @dp.callback_query(F.data == "rocket_stop")
@@ -543,7 +575,7 @@ async def rocket_stop_callback(callback: CallbackQuery):
         "🚀 Ракета взлетает!\n"
         f"Ставка: {amount} {mimriks(amount)}\n"
         f"Множитель: {multiplier:.2f}x\n\n"
-        f"🛑 Вы нажали «Стоп» и выиграли {win} {mimriks(win)}!"
+        f"🛑 Вы нажали «Забрать» и выиграли {win} {mimriks(win)}!"
     )
 
     try:
@@ -553,29 +585,60 @@ async def rocket_stop_callback(callback: CallbackQuery):
 
     await callback.answer(f"Вы забрали {win} {mimriks(win)}!")
 
-def _get_rob_target(message: types.Message, chat_id: int):
-    """Определяет цель для /rob: по реплаю, по entity (text_mention/mention) или по аргументу @username.
-    Возвращает (target_id или None, нужно ли искать по username в БД).
+def _extract_utf16(text: str, offset: int, length: int) -> str:
+    """Извлекает подстроку по offset и length в единицах UTF-16 (как в Telegram API)."""
+    if not text or length <= 0:
+        return ""
+    utf16 = text.encode("utf-16-le")
+    start = offset * 2
+    end = (offset + length) * 2
+    if start >= len(utf16):
+        return ""
+    end = min(end, len(utf16))
+    return utf16[start:end].decode("utf-16-le", errors="replace")
+
+
+async def _resolve_rob_target(message: types.Message, chat_id: int, user_id: int):
     """
+    Определяет user_id жертвы для /rob.
+    Возвращает target_id (int) или None.
+    Приоритет: реплай → text_mention (entity с user) → mention/аргумент @username (поиск в БД).
+    """
+    # 1. Реплай на сообщение
     if message.reply_to_message and message.reply_to_message.from_user:
-        return message.reply_to_message.from_user.id, False
+        return message.reply_to_message.from_user.id
 
     text = (message.text or "").strip()
+
+    # 2. Entity text_mention — Telegram передаёт точный user, без поиска по БД
     for entity in (message.entities or []):
-        if entity.type == "text_mention" and getattr(entity, "user", None):
-            return entity.user.id, False
-        if entity.type == "mention":
-            part = text[entity.offset : entity.offset + entity.length]
+        if getattr(entity, "type", None) == "text_mention":
+            u = getattr(entity, "user", None)
+            if u and getattr(u, "id", None):
+                return u.id
+
+    # 3. Entity mention — вырезаем текст по UTF-16 (offset/length в Telegram в UTF-16) и ищем в БД
+    for entity in (message.entities or []):
+        if getattr(entity, "type", None) == "mention":
+            offset = getattr(entity, "offset", 0)
+            length = getattr(entity, "length", 0)
+            part = _extract_utf16(text, offset, length)
             username = (part or "").lstrip("@").strip().lower()
             if username:
-                return None, (chat_id, username)
+                tid = await db.get_user_id_by_username(chat_id, username)
+                if tid:
+                    return tid
 
-    args = text.split()
-    if len(args) >= 2 and args[1].startswith("@"):
-        username = args[1][1:].strip().lower()
+    # 4. Аргумент команды: /rob @username
+    parts = text.split()
+    if len(parts) >= 2 and parts[1].startswith("@"):
+        username = parts[1][1:].strip().lower()
         if username:
-            return None, (chat_id, username)
-    return None, None
+            tid = await db.get_user_id_by_username(chat_id, username)
+            if tid:
+                return tid
+
+    return None
 
 
 # rob
@@ -591,13 +654,10 @@ async def rob(message: types.Message):
         await message.reply("Сначала /registration")
         return
 
-    target_id, by_username = _get_rob_target(message, chat_id)
-    if target_id is None and isinstance(by_username, tuple):
-        _chat_id, username = by_username
-        target_id = await db.get_user_id_by_username(_chat_id, username)
+    target_id = await _resolve_rob_target(message, chat_id, user_id)
 
     if target_id is None:
-        await message.reply("Использование: /rob @username или реплай на сообщение")
+        await message.reply("Использование: /rob @username или реплай на сообщение цели.")
         return
 
     if target_id == user_id:
@@ -606,11 +666,11 @@ async def rob(message: types.Message):
 
     target_bal = await db.get_balance(target_id, chat_id)
     if target_bal is None:
-        await message.reply("Цель не зарегистрирована.")
+        await message.reply("Цель не зарегистрирована в этом чате.")
         return
 
     if target_bal < 10:
-        await message.reply("У жертвы слишком мало мимриков для кражи.")
+        await message.reply("У жертвы слишком мало мимриков для кражи (нужно минимум 10).")
         return
 
     rob_cooldown = get("rob_cooldown", 1800)
@@ -632,7 +692,6 @@ async def rob(message: types.Message):
     fine_pct = get("rob_fine_percent", 0.1)
 
     if random.random() > rob_success:
-        # Провал — штраф
         fine_amount = max(1, int(bal * fine_pct))
         fine_amount = min(fine_amount, bal)
         if fine_amount > 0:

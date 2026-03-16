@@ -379,11 +379,14 @@ async def get_chat_ids_with_users():
 
 
 async def get_user_id_by_username(chat_id, username):
-    """Возвращает user_id по username в чате."""
+    """Возвращает user_id по username в чате (сравнение без учёта регистра и без @/пробелов)."""
     async with aiosqlite.connect(DB_NAME) as db_conn:
-        uname = (username or "").lstrip("@").lower()
+        uname = (username or "").lstrip("@").strip().lower()
+        if not uname:
+            return None
         cursor = await db_conn.execute(
-            "SELECT user_id FROM users WHERE chat_id = ? AND LOWER(REPLACE(COALESCE(username,''), '@', '')) = ?",
+            """SELECT user_id FROM users
+               WHERE chat_id = ? AND LOWER(TRIM(REPLACE(COALESCE(username,''), '@', ''))) = ?""",
             (chat_id, uname),
         )
         row = await cursor.fetchone()
