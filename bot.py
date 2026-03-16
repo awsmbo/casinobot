@@ -344,11 +344,15 @@ async def coinflip(message: types.Message):
 
     if random.random() < 0.5:
         await db.change_balance(user_id, chat_id, amount * 2)
+        bal = await db.get_balance(user_id, chat_id)
         w = mimriks(amount * 2)
-        await message.reply(f"🪙 Орёл! Вы выиграли {amount * 2} {w}!")
+        await message.reply(f"🪙 Орёл! Вы выиграли {amount * 2} {w}!\n"
+        f"Ваш баланс: {bal} {mimriks(bal)}")
     else:
+        bal = await db.get_balance(user_id, chat_id)
         w = mimriks(amount)
-        await message.reply(f"🪙 Решка. Вы проиграли {amount} {w}.")
+        await message.reply(f"🪙 Решка. Вы проиграли {amount} {w}.\n"
+        f"Ваш баланс: {bal} {mimriks(bal)}")
 
 
 # rob
