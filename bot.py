@@ -505,15 +505,19 @@ async def _roulette_round_runner(chat_id: int):
             if bet_color == spin_color:
                 if bet_color in {"red", "black"}:
                     win = amount * 2
-                else:  # green
-                    win = amount * 14
+                else:  # green (0)
+                    win = amount * 50
                 reason = "угадал цвет"
             else:
                 win = 0
                 reason = "не угадал цвет"
         else:  # number
             if bet_number == spin:
-                win = amount * 36
+                # Число 0 оплачивается повышенным коэффициентом 50x
+                if bet_number == 0:
+                    win = amount * 50
+                else:
+                    win = amount * 36
                 reason = "угадал число"
             else:
                 win = 0
@@ -566,8 +570,9 @@ async def roulette(message: types.Message):
     Где <бет>:
       - red / красное          — ставка на красное (2x)
       - black / чёрное         — ставка на чёрное (2x)
-      - green / зелёное / 0    — ставка на зелёное (0) (14x)
-      - число 0–36             — ставка на конкретное число (36x)
+      - green / зелёное / 0    — ставка на зелёное (0) (50x)
+      - число 1–36             — ставка на конкретное число (36x)
+      - число 0                — ставка на ноль (50x)
     """
     if not await _thread_allowed(message):
         return
@@ -929,9 +934,13 @@ async def rob(message: types.Message):
         fine_amount = max(1, int(bal * fine_pct))
         fine_amount = min(fine_amount, bal)
         if fine_amount > 0:
+            # Штраф списывается с грабителя и начисляется жертве
             await db.change_balance(user_id, chat_id, -fine_amount)
+            await db.change_balance(target_id, chat_id, fine_amount)
             w = mimriks(fine_amount)
-            await message.reply(f"🚔 Вас поймали! Вы потеряли {fine_amount} {w} (штраф за попытку кражи).")
+            await message.reply(
+                f"🚔 Вас поймали! Вы потеряли {fine_amount} {w} (штраф за попытку кражи, начислен жертве)."
+            )
         else:
             await message.reply("🚔 Вас поймали! Кража не удалась. (Штраф не взимается — недостаточно мимриков)")
         return
@@ -1139,11 +1148,27 @@ async def _do_spin(chat_id: int, msg_to_edit: types.Message):
     await db.clear_round_message(chat_id)
 
     w = mimriks(total_bank)
-    await countdown_msg.edit_text(
-        f"🎰 Запуск колеса...\n\n"
-        f"🏆 Победитель: {winner_name}\n"
-        f"💰 Выигрыш: {total_bank} {w}"
-    )
+
+    # Определяем, в какой подчат отправить результат
+    message_thread_id = None
+    if countdown_msg.chat.type in {"group", "supergroup"}:
+        allowed_thread = await db.get_chat_thread(chat_id)
+        if allowed_thread:
+            message_thread_id = allowed_thread
+        else:
+            message_thread_id = getattr(countdown_msg, "message_thread_id", None)
+
+    # Итог раунда отправляем отдельным сообщением
+    try:
+        await bot.send_message(
+            chat_id,
+            f"🎰 Результат раунда ставок:\n\n"
+            f"🏆 Победитель: {winner_name}\n"
+            f"💰 Выигрыш: {total_bank} {w}",
+            message_thread_id=message_thread_id,
+        )
+    except Exception:
+        pass
 
 
 # запуск колеса (админ)
@@ -1179,11 +1204,26 @@ async def spin(message: types.Message):
     await db.clear_round_message(chat_id)
 
     w = mimriks(total_bank)
-    await msg.edit_text(
-        f"🎰 Запуск колеса...\n\n"
-        f"🏆 Победитель: {winner_name}\n"
-        f"💰 Выигрыш: {total_bank} {w}"
-    )
+
+    # Определяем подчат для результата
+    message_thread_id = None
+    if message.chat.type in {"group", "supergroup"}:
+        allowed_thread = await db.get_chat_thread(chat_id)
+        if allowed_thread:
+            message_thread_id = allowed_thread
+        else:
+            message_thread_id = getattr(message, "message_thread_id", None)
+
+    try:
+        await bot.send_message(
+            chat_id,
+            f"🎰 Результат раунда ставок (админский спин):\n\n"
+            f"🏆 Победитель: {winner_name}\n"
+            f"💰 Выигрыш: {total_bank} {w}",
+            message_thread_id=message_thread_id,
+        )
+    except Exception:
+        pass
 
 
 # Сундук
