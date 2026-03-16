@@ -97,11 +97,21 @@ async def _update_or_send_round_message(chat_id: int, text: str, reply_to_messag
                 pass
             await db.clear_round_message(chat_id)
 
+    # Если для чата задан обязательный thread_id — всегда отвечаем туда
+    message_thread_id = None
+    if reply_to_message and reply_to_message.chat.type in {"group", "supergroup"}:
+        allowed_thread = await db.get_chat_thread(chat_id)
+        if allowed_thread:
+            message_thread_id = allowed_thread
+        else:
+            message_thread_id = getattr(reply_to_message, "message_thread_id", None)
+
     msg = await bot.send_message(
         chat_id=chat_id,
         text=text,
         reply_markup=kb,
         reply_to_message_id=reply_to_message.message_id if reply_to_message else None,
+        message_thread_id=message_thread_id,
     )
     await db.set_round_message(chat_id, msg.message_id)
     return msg.message_id
@@ -408,6 +418,7 @@ async def _roulette_round_runner(chat_id: int):
         return
 
     end_ts = state["end_ts"]
+    thread_id = state.get("thread_id")
     # Ждём до конца приёма ставок
     while True:
         now = time.time()
@@ -445,7 +456,11 @@ async def _roulette_round_runner(chat_id: int):
     # Если ставок нет — просто сообщаем и выходим
     if not bets:
         try:
-            await bot.send_message(chat_id, "🎰 Рулетка завершена.\nНи одной ставки не было сделано.")
+            await bot.send_message(
+                chat_id,
+                "🎰 Рулетка завершена.\nНи одной ставки не было сделано.",
+                message_thread_id=thread_id,
+            )
         except Exception:
             pass
         return
@@ -532,7 +547,11 @@ async def _roulette_round_runner(chat_id: int):
 
     # Отправляем сводку в чат отдельным сообщением
     try:
-        await bot.send_message(chat_id, "\n".join(results_lines))
+        await bot.send_message(
+            chat_id,
+            "\n".join(results_lines),
+            message_thread_id=thread_id,
+        )
     except Exception:
         pass
 
@@ -571,6 +590,7 @@ async def roulette(message: types.Message):
             return
 
         end_ts = now + 60
+        thread_id = getattr(message, "message_thread_id", None)
         text = (
             "🎰 Рулетка запущена!\n"
             "У вас есть 60 секунд, чтобы сделать ставки.\n\n"
@@ -584,6 +604,7 @@ async def roulette(message: types.Message):
             "active": True,
             "end_ts": end_ts,
             "message_id": msg.message_id,
+            "thread_id": thread_id,
             "bets": [],  # список словарей: {user_id, amount, bet_type, bet_color, bet_number}
         }
 
@@ -1275,10 +1296,17 @@ async def chest_spawn_task():
             kb = InlineKeyboardBuilder()
             kb.add(InlineKeyboardButton(text="Забрать", callback_data="chest_grab"))
             try:
+                # Если задан обязательный thread_id — шлём сундук только туда
+                message_thread_id = None
+                allowed_thread = await db.get_chat_thread(chat_id)
+                if allowed_thread:
+                    message_thread_id = allowed_thread
+
                 msg = await bot.send_message(
                     chat_id,
                     "📦 В чате появился сундук!",
                     reply_markup=kb.as_markup(),
+                    message_thread_id=message_thread_id,
                 )
                 chest_available[chat_id] = msg.message_id
             except Exception:
@@ -1306,7 +1334,17 @@ async def golden_minute_task():
                 "earnings": {},  # user_id -> (amount, username)
             }
             try:
-                await bot.send_message(chat_id, "🌟 В чате началась золотая минута! Пишите сообщения — получайте мимрики!")
+                # Если задан обязательный thread_id — объявление золотой минуты только туда
+                message_thread_id = None
+                allowed_thread = await db.get_chat_thread(chat_id)
+                if allowed_thread:
+                    message_thread_id = allowed_thread
+
+                await bot.send_message(
+                    chat_id,
+                    "🌟 В чате началась золотая минута! Пишите сообщения — получайте мимрики!",
+                    message_thread_id=message_thread_id,
+                )
             except Exception:
                 golden_minute_active.pop(chat_id, None)
 
