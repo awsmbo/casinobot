@@ -94,6 +94,13 @@ async def init_db():
         )
         """)
 
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS chat_admins(
+            chat_id INTEGER PRIMARY KEY,
+            admin_user_id INTEGER NOT NULL
+        )
+        """)
+
         if needs_migration:
             for uid, username, balance in old_users:
                 await db.execute(
@@ -355,6 +362,38 @@ async def get_chat_thread(chat_id: int):
         )
         row = await cursor.fetchone()
         return row[0] if row else None
+
+
+async def set_chat_admin(chat_id: int, admin_user_id: int):
+    """Кто добавил бота в чат — админ казино для этого чата."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO chat_admins(chat_id, admin_user_id) VALUES (?, ?)",
+            (chat_id, admin_user_id),
+        )
+        await db.commit()
+
+
+async def get_chat_admin(chat_id: int) -> Optional[int]:
+    """user_id админа чата или None, если ещё не зафиксирован (бот не ловил my_chat_member)."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT admin_user_id FROM chat_admins WHERE chat_id = ?",
+            (chat_id,),
+        )
+        row = await cursor.fetchone()
+        return row[0] if row else None
+
+
+async def user_is_any_chat_admin(user_id: int) -> bool:
+    """True, если пользователь — зафиксированный админ хотя бы одного чата (для /settings в личке)."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT 1 FROM chat_admins WHERE admin_user_id = ? LIMIT 1",
+            (user_id,),
+        )
+        row = await cursor.fetchone()
+        return row is not None
 
 
 async def set_chat_thread(chat_id: int, thread_id: int | None):

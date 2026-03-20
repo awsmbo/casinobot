@@ -9,11 +9,8 @@ DEFAULTS = {
     "rob_cooldown": 1800,           # Кулдаун кражи (30 мин)
     "chest_min_interval": 60,       # Мин. интервал сундуков (1 мин)
     "chest_max_interval": 1200,     # Макс. интервал сундуков (20 мин)
-    "golden_minute_duration": 60,   # Длительность золотой минуты
-    "golden_minute_per_message": 10,
     # Вероятности (0-1)
     "rob_success_chance": 0.1,      # Шанс успеха кражи (10%)
-    "golden_minute_chance": 0.15,   # Шанс золотой минуты при проверке
     # Кража
     "rob_steal_percent": 0.2,       # Процент кражи при успехе (20%)
     "rob_fine_percent": 0.1,        # Штраф при провале (10% от баланса жертвы)

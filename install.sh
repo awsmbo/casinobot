@@ -40,9 +40,8 @@ if [ ! -f ".env" ]; then
     cp .env.example .env
     echo "4. Создан файл .env из шаблона."
     echo ""
-    echo "   ВАЖНО: Отредактируйте .env и укажите:"
-    echo "   - BOT_TOKEN — токен от @BotFather"
-    echo "   - ADMIN_ID  — ваш Telegram ID (@userinfobot)"
+    echo "   ВАЖНО: Отредактируйте .env и укажите BOT_TOKEN от @BotFather"
+    echo "   (админ чата — тот, кто добавит бота в группу)"
     echo ""
     echo "   Команда: nano .env"
 else

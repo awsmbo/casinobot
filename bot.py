@@ -4,10 +4,16 @@ import time
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
-from aiogram.types import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.types import (
+    BotCommand,
+    ChatMemberUpdated,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    CallbackQuery,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from config import BOT_TOKEN, ADMIN_ID
+from config import BOT_TOKEN
 import db
 from utils import mimriks
 from settings import get_settings, get, set_value, set_multiple, DEFAULTS
@@ -18,14 +24,33 @@ dp = Dispatcher()
 # Состояние для раундов (chat_id -> message_id для редактирования)
 round_messages_cache = {}
 
-# Золотая минута: {chat_id: {"end": ts, "earnings": {user_id: amount}}}
-golden_minute_active = {}
-
 # Rocket: (chat_id, user_id) -> {"amount": int, "multiplier": float, "active": bool, "message_id": int}
 rocket_games = {}
 
 # Roulette: chat_id -> {"active": bool, "end_ts": float, "message_id": int, "bets": [...]}
 roulette_rounds = {}
+
+# Сапёр: (chat_id, user_id) -> состояние игры
+mines_games = {}
+
+# 5 коэффициентов по порядку открытия (каждый больше предыдущего), произведение ≈ ×50.5
+MINES_MULTS = [1.2, 1.45, 1.8, 2.6, 6.2]
+MINES_SAFE = 5
+MINES_GRID = 16
+
+
+@dp.my_chat_member()
+async def on_bot_chat_member(event: ChatMemberUpdated):
+    """Запоминаем пользователя, который добавил бота в группу / вернул бота в чат."""
+    if event.chat.type not in ("group", "supergroup"):
+        return
+    old = event.old_chat_member.status
+    new = event.new_chat_member.status
+    # Впервые в чате или после left/kicked
+    if old in ("left", "kicked") and new in ("member", "administrator", "restricted"):
+        u = event.from_user
+        if u is not None and not u.is_bot:
+            await db.set_chat_admin(event.chat.id, u.id)
 
 
 async def _thread_allowed(message: types.Message) -> bool:
@@ -119,8 +144,8 @@ def _private_instructions() -> str:
         "3. Делайте ставки: /bet 100\n"
         "4. Когда все готовы — нажмите кнопку «Запустить» под сообщением со ставками\n"
         "5. Победитель определяется случайно (чем больше ставка — тем выше шанс)\n\n"
-        "Другие команды: /transfer, /coinflip, /rob, /leaderboard\n"
-        "Сундуки и золотая минута появляются случайно!\n\n"
+        "Другие команды: /transfer, /coinflip, /mines, /rob, /leaderboard\n"
+        "Сундуки появляются случайно!\n\n"
         f"🔗 Исходный код: {GITHUB_URL}"
     )
 
@@ -156,10 +181,11 @@ async def help_cmd(message: types.Message):
         "/bank — текущий банк раунда\n"
         "/transfer @user <сумма> — передать мимрики другому игроку\n"
         "/coinflip <сумма> — 50/50: проиграть или удвоить\n"
+        "/mines <сумма> — сапёр: 4×4, множители или бомба\n"
         "/rocket <сумма> — игра с растущим множителем и риском взрыва\n"
         "/rob @user — попытаться украсть мимрики (10% шанс, 1 раз в 30 мин)\n"
         "/leaderboard — топ игроков\n"
-        "Сундуки и золотая минута появляются случайно в чате!"
+        "Сундуки появляются случайно в чате!"
     )
 
 
@@ -400,6 +426,230 @@ async def coinflip(message: types.Message):
         w = mimriks(amount)
         await message.reply(f"🪙 Решка. Вы проиграли {amount} {w}.\n"
         f"Ваш баланс: {bal} {mimriks(bal)}")
+
+
+def _mines_game_text(state: dict, *, over: bool = False, win: bool = False) -> str:
+    amount = state["amount"]
+    product = state["product"]
+    safe_opened = state["safe_opened"]
+    win_amt = int(amount * product)
+
+    if over and not win:
+        return (
+            "💥 Бомба! Ставка проиграна.\n\n"
+            f"Ставка: {amount} {mimriks(amount)}\n"
+            f"До взрыва открыто множителей: {safe_opened}/{MINES_SAFE}\n"
+            f"Множитель был: ×{product:.2f}"
+        )
+
+    if over and win:
+        return (
+            "🎉 Поздравляем!\n\n"
+            f"Вы забрали {win_amt} {mimriks(win_amt)}.\n"
+            f"Итоговый множитель: ×{product:.2f} ({safe_opened} из {MINES_SAFE})"
+        )
+
+    lines = [
+        "💣 Сапёр",
+        "",
+        f"Ставка: {amount} {mimriks(amount)}",
+        f"Текущий множитель: ×{product:.2f}",
+        f"Можно забрать сейчас: {win_amt} {mimriks(win_amt)}",
+        "",
+        f"Открыто множителей: {safe_opened}/{MINES_SAFE}",
+    ]
+    if safe_opened == 0:
+        lines.append("Откройте клетку. После первого множителя появится кнопка «Забрать приз».")
+    else:
+        lines.append("Дальше — только клетки с «▢» или заберите приз.")
+    return "\n".join(lines)
+
+
+def _mines_build_keyboard(state: dict) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    safe_cells = state["safe_cells"]
+    revealed = state["revealed"]
+    revealed_mults = state["revealed_mults"]
+    active = state["active"]
+
+    for row in range(4):
+        row_btns = []
+        for col in range(4):
+            idx = row * 4 + col
+            if idx in revealed:
+                if idx in revealed_mults:
+                    m = revealed_mults[idx]
+                    label = f"×{m:.2f}"
+                else:
+                    label = "💥"
+                row_btns.append(
+                    InlineKeyboardButton(text=label, callback_data="ms_n")
+                )
+            else:
+                row_btns.append(
+                    InlineKeyboardButton(text="▢", callback_data=f"ms_o_{idx}")
+                )
+        builder.row(*row_btns)
+
+    if active and state["safe_opened"] >= 1:
+        builder.row(
+            InlineKeyboardButton(text="💰 Забрать приз", callback_data="ms_c"),
+        )
+
+    return builder.as_markup()
+
+
+async def _mines_finish(
+    chat_id: int,
+    message_id: int,
+    key: tuple,
+    state: dict,
+    *,
+    win: bool,
+):
+    state["active"] = False
+    mines_games.pop(key, None)
+    text = _mines_game_text(state, over=True, win=win)
+    try:
+        await bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+
+@dp.message(Command("mines"))
+async def mines_cmd(message: types.Message):
+    """Игра «Сапёр»: 4×4 клеток, 5 множителей, 11 бомб. /mines <ставка>"""
+    if not await _thread_allowed(message):
+        return
+    args = (message.text or "").split()
+    if len(args) != 2:
+        await message.reply("Использование: /mines <ставка>")
+        return
+    try:
+        amount = int(args[1])
+    except ValueError:
+        await message.reply("Ставка должна быть числом.")
+        return
+    if amount < 1:
+        await message.reply("Минимальная ставка — 1 мимрик.")
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    key = (chat_id, user_id)
+
+    if key in mines_games and mines_games[key].get("active"):
+        await message.reply("У вас уже идёт игра в сапёра. Сначала закончите её.")
+        return
+
+    bal = await db.get_balance(user_id, chat_id)
+    if bal is None:
+        await message.reply("Сначала /registration")
+        return
+    if amount > bal:
+        await message.reply(f"Недостаточно {mimriks(amount)}.")
+        return
+
+    await db.change_balance(user_id, chat_id, -amount)
+
+    safe_cells = set(random.sample(range(MINES_GRID), MINES_SAFE))
+    state = {
+        "amount": amount,
+        "safe_cells": safe_cells,
+        "revealed": set(),
+        "revealed_mults": {},
+        "safe_opened": 0,
+        "product": 1.0,
+        "active": True,
+        "message_id": 0,
+    }
+
+    text = _mines_game_text(state)
+    kb = _mines_build_keyboard(state)
+    msg = await message.reply(text, reply_markup=kb)
+    state["message_id"] = msg.message_id
+    mines_games[key] = state
+
+
+@dp.callback_query(F.data.startswith("ms_"))
+async def mines_callback(callback: CallbackQuery):
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    key = (chat_id, user_id)
+    state = mines_games.get(key)
+
+    if not state or not state.get("active"):
+        await callback.answer("Игра не найдена или уже завершена.", show_alert=True)
+        return
+
+    if callback.message.message_id != state["message_id"]:
+        await callback.answer("Устаревшее сообщение.", show_alert=True)
+        return
+
+    data = callback.data or ""
+
+    if data == "ms_n":
+        await callback.answer()
+        return
+
+    if data == "ms_c":
+        if state["safe_opened"] < 1:
+            await callback.answer("Сначала откройте хотя бы одну клетку с множителем.", show_alert=True)
+            return
+        win = int(state["amount"] * state["product"])
+        await db.change_balance(user_id, chat_id, win)
+        await _mines_finish(chat_id, state["message_id"], key, state, win=True)
+        await callback.answer(f"Забрали {win} {mimriks(win)}!")
+        return
+
+    if not data.startswith("ms_o_"):
+        await callback.answer()
+        return
+
+    try:
+        idx = int(data[5:])  # после "ms_o_"
+    except ValueError:
+        await callback.answer()
+        return
+
+    if idx < 0 or idx >= MINES_GRID or idx in state["revealed"]:
+        await callback.answer("Клетка уже открыта.")
+        return
+
+    state["revealed"].add(idx)
+
+    if idx not in state["safe_cells"]:
+        # Бомба
+        await _mines_finish(chat_id, state["message_id"], key, state, win=False)
+        await callback.answer("💥 Бомба!", show_alert=True)
+        return
+
+    # Множитель по порядку открытия безопасных клеток
+    mult = MINES_MULTS[state["safe_opened"]]
+    state["revealed_mults"][idx] = mult
+    state["safe_opened"] += 1
+    state["product"] *= mult
+
+    if state["safe_opened"] >= MINES_SAFE:
+        # Все 5 множителей — автоматический максимальный выигрыш
+        win = int(state["amount"] * state["product"])
+        await db.change_balance(user_id, chat_id, win)
+        await _mines_finish(chat_id, state["message_id"], key, state, win=True)
+        await callback.answer(f"Джекпот! +{win} {mimriks(win)}!")
+        return
+
+    text = _mines_game_text(state)
+    kb = _mines_build_keyboard(state)
+    try:
+        await callback.message.edit_text(text=text, reply_markup=kb)
+    except Exception:
+        pass
+    await callback.answer(f"×{mult:.2f}")
 
 
 async def _roulette_round_runner(chat_id: int):
@@ -949,10 +1199,7 @@ SETTINGS_KEYS = {
     "rob_cooldown": ("Кулдаун кражи (сек)", int, "Тайминги"),
     "chest_min_interval": ("Мин. интервал сундуков (сек)", int, "Тайминги"),
     "chest_max_interval": ("Макс. интервал сундуков (сек)", int, "Тайминги"),
-    "golden_minute_duration": ("Длительность золотой минуты (сек)", int, "Тайминги"),
-    "golden_minute_per_message": ("Мимриков за сообщение в зол. мин", int, "Тайминги"),
     "rob_success_chance": ("Шанс успеха кражи (0-1)", float, "Вероятности"),
-    "golden_minute_chance": ("Шанс золотой минуты (0-1)", float, "Вероятности"),
     "rob_steal_percent": ("% кражи при успехе (0-1)", float, "Кража"),
     "rob_fine_percent": ("% штрафа при провале (0-1)", float, "Кража"),
 }
@@ -960,7 +1207,13 @@ SETTINGS_KEYS = {
 
 @dp.message(Command("settings"))
 async def settings_cmd(message: types.Message):
-    if message.from_user.id != ADMIN_ID or message.chat.type != "private":
+    if message.chat.type != "private":
+        return
+    if not await db.user_is_any_chat_admin(message.from_user.id):
+        await message.reply(
+            "Настройки доступны только тому, кто добавил бота в группу.\n"
+            "Сначала добавьте бота в чат — вы станете админом казино для этой группы."
+        )
         return
     s = get_settings()
     lines = ["⚙️ Текущие настройки:\n"]
@@ -975,15 +1228,20 @@ async def settings_cmd(message: types.Message):
 
 @dp.message(Command("set"))
 async def set_cmd(message: types.Message):
-    if message.from_user.id != ADMIN_ID or message.chat.type != "private":
+    if message.chat.type != "private":
+        return
+    if not await db.user_is_any_chat_admin(message.from_user.id):
+        await message.reply(
+            "Команда доступна только тому, кто добавил бота в группу.\n"
+            "Сначала добавьте бота в чат."
+        )
         return
     args = message.text.split(maxsplit=2)
     if len(args) < 3:
         await message.reply(
             "Использование: /set <ключ> <значение>\n"
             "Ключи: rob_cooldown, chest_min_interval, chest_max_interval, "
-            "golden_minute_duration, golden_minute_per_message, rob_success_chance, "
-            "golden_minute_chance, rob_steal_percent, rob_fine_percent"
+            "rob_success_chance, rob_steal_percent, rob_fine_percent"
         )
         return
     key = args[1].lower()
@@ -1004,11 +1262,11 @@ async def set_cmd(message: types.Message):
 async def set_thread_cmd(message: types.Message):
     """Установка разрешённого thread_id для чата.
 
-    Использование (только в личке с админом бота):
+    Использование (только в личке, от имени того, кто добавил бота в этот чат):
     /set_thread <chat_id> <thread_id>
     Передать 0 вместо thread_id, чтобы снять ограничение для чата.
     """
-    if message.from_user.id != ADMIN_ID or message.chat.type != "private":
+    if message.chat.type != "private":
         return
 
     args = message.text.split()
@@ -1027,7 +1285,14 @@ async def set_thread_cmd(message: types.Message):
         await message.reply("chat_id и thread_id должны быть числами.")
         return
 
-    # Проверяем, что админ действительно админ в этом чате
+    inviter = await db.get_chat_admin(chat_id)
+    if inviter is None or inviter != message.from_user.id:
+        await message.reply(
+            "Настроить подчат может только тот пользователь, который добавил бота в этот чат."
+        )
+        return
+
+    # Проверяем, что пользователь действительно админ в этом чате
     try:
         member = await bot.get_chat_member(chat_id, message.from_user.id)
     except Exception:
@@ -1046,10 +1311,20 @@ async def set_thread_cmd(message: types.Message):
         await message.reply(f"✅ Ограничение по thread_id для чата {chat_id} снято.")
 
 
-# админ начисление
+# админ начисление (в группе — только тот, кто добавил бота)
 @dp.message(Command("addcoins"))
 async def addcoins(message: types.Message):
-    if message.from_user.id != ADMIN_ID:
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    chat_id = message.chat.id
+    inviter = await db.get_chat_admin(chat_id)
+    if inviter is None:
+        await message.reply(
+            "Админ чата не зафиксирован. Удалите бота из группы и добавьте снова — "
+            "тот, кто добавит, сможет использовать админ-команды."
+        )
+        return
+    if message.from_user.id != inviter:
         return
 
     if not message.reply_to_message:
@@ -1162,15 +1437,24 @@ async def _do_spin(chat_id: int, msg_to_edit: types.Message):
         pass
 
 
-# запуск колеса (админ)
+# запуск колеса (админ чата — тот, кто добавил бота)
 @dp.message(Command("spin"))
 async def spin(message: types.Message):
     if not await _thread_allowed(message):
         return
-    if message.from_user.id != ADMIN_ID:
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    chat_id = message.chat.id
+    inviter = await db.get_chat_admin(chat_id)
+    if inviter is None:
+        await message.reply(
+            "Админ чата не зафиксирован. Удалите бота из группы и добавьте снова — "
+            "тот, кто добавит, сможет использовать /spin."
+        )
+        return
+    if message.from_user.id != inviter:
         return
 
-    chat_id = message.chat.id
     bets = await db.get_all_bets(chat_id)
 
     if not bets:
@@ -1344,42 +1628,6 @@ async def chest_spawn_task():
                 pass
 
 
-# Золотая минута
-async def golden_minute_task():
-    while True:
-        await asyncio.sleep(600)  # проверка каждые 10 минут
-        try:
-            chat_ids = await db.get_chat_ids_with_users()
-        except Exception:
-            continue
-
-        for chat_id in chat_ids:
-            if chat_id in golden_minute_active:
-                continue
-            if random.random() > get("golden_minute_chance", 0.15):
-                continue
-
-            duration = get("golden_minute_duration", 60)
-            golden_minute_active[chat_id] = {
-                "end": time.time() + duration,
-                "earnings": {},  # user_id -> (amount, username)
-            }
-            try:
-                # Если задан обязательный thread_id — объявление золотой минуты только туда
-                message_thread_id = None
-                allowed_thread = await db.get_chat_thread(chat_id)
-                if allowed_thread:
-                    message_thread_id = allowed_thread
-
-                await bot.send_message(
-                    chat_id,
-                    "🌟 В чате началась золотая минута! Пишите сообщения — получайте мимрики!",
-                    message_thread_id=message_thread_id,
-                )
-            except Exception:
-                golden_minute_active.pop(chat_id, None)
-
-
 # Личка: на любое сообщение — инструкция
 @dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def private_any_message(message: types.Message):
@@ -1393,43 +1641,6 @@ async def debug_thread(message: types.Message):
     )
 
 
-@dp.message(F.text)
-async def on_any_message(message: types.Message):
-    if not await _thread_allowed(message):
-        return
-    chat_id = message.chat.id
-    if chat_id not in golden_minute_active:
-        return
-
-    state = golden_minute_active[chat_id]
-    if time.time() > state["end"]:
-        earnings = state.get("earnings", {})  # user_id -> (amount, username)
-        lines = ["🌟 Золотая минута окончена!\n\nСводка:"]
-        items = [(amt, name) for (amt, name) in earnings.values() if amt > 0]
-        items.sort(key=lambda x: -x[0])
-        for amt, name in items:
-            lines.append(f"• {name}: +{amt} {mimriks(amt)}")
-        if len(lines) == 1:
-            lines.append("Никто не заработал.")
-        try:
-            await message.reply("\n".join(lines))
-        except Exception:
-            pass
-        golden_minute_active.pop(chat_id, None)
-        return
-
-    user_id = message.from_user.id
-    if await db.get_balance(user_id, chat_id) is None:
-        return
-
-    per_msg = get("golden_minute_per_message", 10)
-    prev = state["earnings"].get(user_id, (0, ""))
-    amt = prev[0] + per_msg
-    name = message.from_user.username or message.from_user.first_name or "?"
-    state["earnings"][user_id] = (amt, name)
-    await db.change_balance(user_id, chat_id, per_msg)
-
-
 BOT_COMMANDS = [
     BotCommand(command="start", description="Приветствие"),
     BotCommand(command="help", description="Список команд"),
@@ -1439,12 +1650,12 @@ BOT_COMMANDS = [
     BotCommand(command="bank", description="Текущий банк раунда"),
     BotCommand(command="transfer", description="Перевести мимрики"),
     BotCommand(command="coinflip", description="50/50: удвоить или проиграть"),
+    BotCommand(command="mines", description="Сапёр: множители и бомбы"),
     BotCommand(command="rocket", description="Ракета (временно отключена)"),
     BotCommand(command="roulette", description="Рулетка: цвета и числа"),
     BotCommand(command="rob", description="Попытаться украсть мимрики"),
     BotCommand(command="chest", description="Забрать сундук"),
     BotCommand(command="leaderboard", description="Топ игроков"),
-    BotCommand(command="addcoins", description="(админ) Начислить мимрики"),
     BotCommand(command="spin", description="(админ) Запустить рулетку"),
 ]
 
@@ -1453,7 +1664,6 @@ async def main():
     await db.init_db()
     await bot.set_my_commands(BOT_COMMANDS)
     asyncio.create_task(chest_spawn_task())
-    asyncio.create_task(golden_minute_task())
     await dp.start_polling(bot)
 
 
