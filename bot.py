@@ -6,6 +6,8 @@ from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeDefault,
     ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -525,6 +527,7 @@ async def _mines_finish(
 async def mines_cmd(message: types.Message):
     """Игра «Сапёр»: 4×4 клеток, 5 множителей, 11 бомб. /mines <ставка>"""
     if not await _thread_allowed(message):
+        await message.reply("Используйте /mines в нужной теме чата (если в группе есть темы).")
         return
     args = (message.text or "").split()
     if len(args) != 2:
@@ -829,6 +832,7 @@ async def roulette(message: types.Message):
       - число 0                — ставка на ноль (50x)
     """
     if not await _thread_allowed(message):
+        await message.reply("Используйте /roulette в нужной теме чата (если в группе есть темы).")
         return
 
     args = (message.text or "").split()
@@ -999,6 +1003,7 @@ ROCKET_CURVE_P = 1.35
 @dp.message(Command("rocket"))
 async def rocket(message: types.Message):
     if not await _thread_allowed(message):
+        await message.reply("Используйте /rocket в нужной теме чата (если в группе есть темы).")
         return
     args = (message.text or "").split()
     if len(args) != 2:
@@ -1783,7 +1788,8 @@ BOT_COMMANDS = [
 
 async def main():
     await db.init_db()
-    await bot.set_my_commands(BOT_COMMANDS)
+    await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
     asyncio.create_task(chest_spawn_task())
     await dp.start_polling(bot)
 
