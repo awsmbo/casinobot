@@ -560,6 +560,7 @@ async def mines_cmd(message: types.Message):
     safe_cells = set(random.sample(range(MINES_GRID), MINES_SAFE))
     state = {
         "amount": amount,
+        "owner_id": user_id,
         "safe_cells": safe_cells,
         "revealed": set(),
         "revealed_mults": {},
@@ -581,14 +582,26 @@ async def mines_callback(callback: CallbackQuery):
     chat_id = callback.message.chat.id
     user_id = callback.from_user.id
     key = (chat_id, user_id)
-    state = mines_games.get(key)
+    mid = callback.message.message_id
 
+    state = mines_games.get(key)
     if not state or not state.get("active"):
+        # Сообщение сапёра могло быть от другого игрока
+        for (c, owner_id), st in mines_games.items():
+            if c == chat_id and st.get("message_id") == mid and st.get("active"):
+                if owner_id != user_id:
+                    await callback.answer("Это игра другого игрока.", show_alert=True)
+                    return
+                break
         await callback.answer("Игра не найдена или уже завершена.", show_alert=True)
         return
 
-    if callback.message.message_id != state["message_id"]:
+    if mid != state["message_id"]:
         await callback.answer("Устаревшее сообщение.", show_alert=True)
+        return
+
+    if state.get("owner_id", user_id) != user_id:
+        await callback.answer("Это не ваша игра.", show_alert=True)
         return
 
     data = callback.data or ""
@@ -957,16 +970,11 @@ async def roulette(message: types.Message):
         f"Результат будет после окончания раунда."
     )
 
-# --- Ракета: формула распределения и логика роста ---
-# Распределение множителя краша:
-#   r ~ U(0, 1) (равномерно от 0 до 1), multiplier = 1 / (1 - r), макс 10.00.
-#   P(multiplier <= x) = P(1/(1-r) <= x) = P(r <= 1 - 1/x) = 1 - 1/x  при x >= 1.
-#   Плотность: f(x) = 1/x^2 при x >= 1 — тяжёлый хвост (малые x частые, большие редкие).
-#   Ожидаемое распределение: 1–1.2x очень часто, 1.2–2 часто, 2–3 иногда, 3–5 редко, 5–10 очень редко.
-# Рост коэффициента на экране:
-#   mult(t) = crash_point^(t/T), t от 0 до T. При t=0 mult=1, при t=T mult=crash_point.
-#   Производная растёт с t → визуально медленно в начале, быстрее на больших множителях.
-#   T = 2 + crash_point*0.6 сек, обновление каждые 0.5 с → раунд ~3–8 сек при средних множителях.
+# --- Ракета ---
+# Краш-мультипликатор: r ~ U(0,1), crash = min(10, 1/(1-r)) — тяжёлый хвост.
+# Длительность полёта T ~ U[T_MIN, T_MAX] задаётся НЕЗАВИСИМО от crash_point,
+# чтобы по «скорости» роста нельзя было угадать высоту краша.
+# Отображение: mult(t) = crash_point^((t/T)^p), p>1 — плавный старт, ускорение к концу.
 
 
 def _generate_crash_multiplier() -> float:
@@ -981,46 +989,124 @@ def _generate_crash_multiplier() -> float:
     return round(min(10.0, 1.0 / (1.0 - r)), 2)
 
 
+# Длительность анимации (сек) — случайная, не связана с crash_point
+ROCKET_DURATION_MIN = 5.0
+ROCKET_DURATION_MAX = 11.0
+ROCKET_TICK = 1.0
+ROCKET_CURVE_P = 1.35
+
+
 @dp.message(Command("rocket"))
 async def rocket(message: types.Message):
-    await message.reply("🚀 Игра с ракетой временно отключена для доработки.")
-    return
+    if not await _thread_allowed(message):
+        return
+    args = (message.text or "").split()
+    if len(args) != 2:
+        await message.reply("Использование: /rocket <сумма>")
+        return
+
+    try:
+        amount = int(args[1])
+    except ValueError:
+        await message.reply("Сумма должна быть числом.")
+        return
+
+    if amount < 1:
+        await message.reply("Минимальная ставка — 1 мимрик.")
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    key = (chat_id, user_id)
+
+    if key in rocket_games and rocket_games[key].get("active"):
+        await message.reply("У вас уже запущена ракета. Дождитесь окончания игры.")
+        return
+
+    bal = await db.get_balance(user_id, chat_id)
+    if bal is None:
+        await message.reply("Сначала /registration")
+        return
+
+    if amount > bal:
+        await message.reply(f"Недостаточно {mimriks(amount)}.")
+        return
+
+    await db.change_balance(user_id, chat_id, -amount)
+
+    crash_point = _generate_crash_multiplier()
+    duration = random.uniform(ROCKET_DURATION_MIN, ROCKET_DURATION_MAX)
+
+    kb = InlineKeyboardBuilder()
+    kb.add(InlineKeyboardButton(text="Забрать", callback_data="rocket_stop"))
+
+    intro = (
+        "🚀 Ракета взлетает!\n"
+        f"Ставка: {amount} {mimriks(amount)}\n"
+        f"Множитель: 1.00x\n\n"
+        "Рост по фиксированной кривой до случайного краша (макс. 10.00x). "
+        "Длительность полёта не подсказывает, на каком множителе будет взрыв.\n\n"
+        "Нажмите «Забрать», чтобы забрать выигрыш."
+    )
+    msg = await message.reply(intro, reply_markup=kb.as_markup())
+
+    rocket_games[key] = {
+        "amount": amount,
+        "multiplier": 1.0,
+        "active": True,
+        "message_id": msg.message_id,
+        "crash_point": crash_point,
+        "duration": duration,
+        "flight_epoch": 0,
+        "finalized": False,
+    }
+
+    asyncio.create_task(_rocket_flight(chat_id, user_id))
 
 
 async def _rocket_flight(chat_id: int, user_id: int):
-    """
-    Анимация роста множителя от 1.00x до crash_point.
-    Рост по формуле mult(t) = crash_point^((t/T)^p): медленно в начале, быстрее к концу.
-    Обновление сообщения каждые 1 с. Длительность раунда T увеличена для более плавного роста.
-    """
     key = (chat_id, user_id)
     state = rocket_games.get(key)
     if not state or not state["active"]:
         return
 
+    epoch_at_start = state["flight_epoch"]
     amount = state["amount"]
     crash_point = state["crash_point"]
-    update_interval = 1.0
-    # Длительность раунда: дольше при 1 с тиках — более плавный рост (~4–12 сек)
-    duration = 3.0 + crash_point * 0.9
-    # Показатель плавности роста: >1 даёт более медленный старт
-    p = 1.3
+    duration = state["duration"]
+    p = ROCKET_CURVE_P
     t = 0.0
 
-    while state["active"] and t < duration:
-        await asyncio.sleep(update_interval)
-        t += update_interval
+    def _aborted() -> bool:
+        st = rocket_games.get(key)
+        if st is not state:
+            return True
+        if st.get("flight_epoch") != epoch_at_start:
+            return True
+        if st.get("finalized"):
+            return True
+        return False
 
-        # Текущий множитель: экспонента от 1 до crash_point (медленно в начале, быстрее на больших)
+    while state.get("active") and t < duration:
+        await asyncio.sleep(ROCKET_TICK)
+        if _aborted():
+            return
+
+        t += ROCKET_TICK
         progress = min(1.0, t / duration)
         current_mult = crash_point ** (progress**p)
         current_mult = min(current_mult, crash_point)
         current_mult = round(current_mult, 2)
         state["multiplier"] = current_mult
 
-        # Краш: мы достигли момента краша по времени
+        if _aborted():
+            return
+
         if t >= duration:
+            if _aborted():
+                return
             state["active"] = False
+            state["finalized"] = True
             text = (
                 "🚀 Ракета взлетает!\n"
                 f"Ставка: {amount} {mimriks(amount)}\n"
@@ -1036,14 +1122,15 @@ async def _rocket_flight(chat_id: int, user_id: int):
                 )
             except Exception:
                 pass
+            rocket_games.pop(key, None)
             return
 
-        # Обновляем сообщение с текущим множителем
         text = (
             "🚀 Ракета взлетает!\n"
             f"Ставка: {amount} {mimriks(amount)}\n"
             f"Множитель: {current_mult:.2f}x\n\n"
-            "Нажмите «Забрать», чтобы зафиксировать выигрыш."
+            "Рост по фиксированной кривой; момент краша заранее не угадывается.\n\n"
+            "Нажмите «Забрать», чтобы забрать выигрыш."
         )
         try:
             kb = InlineKeyboardBuilder()
@@ -1056,14 +1143,48 @@ async def _rocket_flight(chat_id: int, user_id: int):
             )
         except Exception:
             state["active"] = False
+            state["finalized"] = True
+            rocket_games.pop(key, None)
             return
-
-    # Раунд закончился по таймауту без краша (игрок уже забрал или ошибка)
 
 
 @dp.callback_query(F.data == "rocket_stop")
 async def rocket_stop_callback(callback: CallbackQuery):
-    await callback.answer("Игра с ракетой временно отключена.", show_alert=True)
+    chat_id = callback.message.chat.id
+    user_id = callback.from_user.id
+    key = (chat_id, user_id)
+
+    state = rocket_games.get(key)
+    if not state or not state.get("active"):
+        await callback.answer("Игра уже завершена.", show_alert=True)
+        return
+
+    # Снимок множителя до инвалидации полёта (чтобы не промахнуться с тиком фона)
+    amount = state["amount"]
+    multiplier = state["multiplier"]
+    # Инвалидируем цикл _rocket_flight — после этого он не редактирует сообщение
+    state["flight_epoch"] = state.get("flight_epoch", 0) + 1
+    state["active"] = False
+    state["finalized"] = True
+
+    win = int(amount * multiplier)
+
+    await db.change_balance(user_id, chat_id, win)
+
+    text = (
+        "🚀 Ракета взлетает!\n"
+        f"Ставка: {amount} {mimriks(amount)}\n"
+        f"Множитель: {multiplier:.2f}x\n\n"
+        f"🛑 Вы нажали «Забрать» и выиграли {win} {mimriks(win)}!"
+    )
+
+    try:
+        await callback.message.edit_text(text, reply_markup=None)
+    except Exception:
+        pass
+
+    rocket_games.pop(key, None)
+    await callback.answer(f"Вы забрали {win} {mimriks(win)}!")
 
 def _extract_utf16(text: str, offset: int, length: int) -> str:
     """Извлекает подстроку по offset и length в единицах UTF-16 (как в Telegram API)."""
@@ -1651,7 +1772,7 @@ BOT_COMMANDS = [
     BotCommand(command="transfer", description="Перевести мимрики"),
     BotCommand(command="coinflip", description="50/50: удвоить или проиграть"),
     BotCommand(command="mines", description="Сапёр: множители и бомбы"),
-    BotCommand(command="rocket", description="Ракета (временно отключена)"),
+    BotCommand(command="rocket", description="Ракета: множитель до краша"),
     BotCommand(command="roulette", description="Рулетка: цвета и числа"),
     BotCommand(command="rob", description="Попытаться украсть мимрики"),
     BotCommand(command="chest", description="Забрать сундук"),
