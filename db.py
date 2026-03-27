@@ -1,10 +1,41 @@
+import json
 import os
-from typing import Optional
+from datetime import date
+from typing import Any, Optional
 
 import aiosqlite
 
 DB_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_NAME = os.path.join(DB_DIR, "casino.db")
+
+
+def default_user_stats() -> dict[str, Any]:
+    return {
+        "plays": {"round": 0, "coinflip": 0, "mines": 0, "roulette": 0, "slot": 0},
+        "won": {"round": 0, "coinflip": 0, "mines": 0, "roulette": 0, "slot": 0},
+        "lost": {"round": 0, "coinflip": 0, "mines": 0, "roulette": 0, "slot": 0},
+        "totals": {"won": 0, "lost": 0},
+        "max_win": {"amount": 0, "game": ""},
+        "max_loss": {"amount": 0, "game": ""},
+        "rob": {
+            "attempts": 0,
+            "success": 0,
+            "stolen_as_robber": 0,
+            "fines_paid": 0,
+            "stolen_from_victim": 0,
+        },
+        "chest": {"opened": 0, "mimriks": 0},
+        "transfer": {"sent": 0},
+    }
+
+
+GAME_LABELS_RU = {
+    "round": "Раунд ставок",
+    "coinflip": "Coinflip",
+    "mines": "Сапёр",
+    "roulette": "Рулетка",
+    "slot": "Слот",
+}
 
 
 async def init_db():
@@ -98,6 +129,32 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS chat_admins(
             chat_id INTEGER PRIMARY KEY,
             admin_user_id INTEGER NOT NULL
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS user_stats(
+            user_id INTEGER,
+            chat_id INTEGER,
+            stats_json TEXT NOT NULL,
+            PRIMARY KEY (user_id, chat_id)
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS daily_quest_state(
+            user_id INTEGER,
+            chat_id INTEGER,
+            day TEXT NOT NULL,
+            coinflip_count INTEGER DEFAULT 0,
+            rob_success INTEGER DEFAULT 0,
+            roulette_wins INTEGER DEFAULT 0,
+            mines_plays INTEGER DEFAULT 0,
+            reward_coinflip INTEGER DEFAULT 0,
+            reward_rob INTEGER DEFAULT 0,
+            reward_roulette INTEGER DEFAULT 0,
+            reward_mines INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, chat_id, day)
         )
         """)
 
@@ -440,3 +497,285 @@ async def update_username(user_id, chat_id, username):
             (username, user_id, chat_id),
         )
         await db.commit()
+
+
+# --- Статистика пользователя ---
+
+
+async def get_user_stats(user_id: int, chat_id: int) -> dict[str, Any]:
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            "SELECT stats_json FROM user_stats WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id),
+        )
+        row = await cursor.fetchone()
+    if not row or not row[0]:
+        return default_user_stats()
+    try:
+        data = json.loads(row[0])
+    except (json.JSONDecodeError, TypeError):
+        return default_user_stats()
+    base = default_user_stats()
+    # Мягкое слияние с дефолтом (новые ключи)
+    for k, v in base.items():
+        if k not in data:
+            data[k] = v
+        elif isinstance(v, dict) and isinstance(data[k], dict):
+            for sk, sv in v.items():
+                data[k].setdefault(sk, sv)
+    return data
+
+
+async def _save_user_stats(user_id: int, chat_id: int, stats: dict[str, Any]) -> None:
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT INTO user_stats(user_id, chat_id, stats_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id, chat_id) DO UPDATE SET stats_json = excluded.stats_json
+            """,
+            (user_id, chat_id, json.dumps(stats, ensure_ascii=False)),
+        )
+        await db.commit()
+
+
+async def stats_record_game(
+    user_id: int,
+    chat_id: int,
+    game_key: str,
+    *,
+    net_won: int = 0,
+    net_lost: int = 0,
+    count_play: bool = True,
+) -> None:
+    if net_won < 0 or net_lost < 0:
+        return
+    stats = await get_user_stats(user_id, chat_id)
+    g = GAME_LABELS_RU.get(game_key, game_key)
+    if count_play:
+        stats["plays"].setdefault(game_key, 0)
+        stats["plays"][game_key] = stats["plays"].get(game_key, 0) + 1
+    if net_won > 0:
+        stats["won"].setdefault(game_key, 0)
+        stats["won"][game_key] = stats["won"].get(game_key, 0) + net_won
+        stats["totals"]["won"] += net_won
+        if net_won > stats["max_win"]["amount"]:
+            stats["max_win"] = {"amount": net_won, "game": g}
+    if net_lost > 0:
+        stats["lost"].setdefault(game_key, 0)
+        stats["lost"][game_key] = stats["lost"].get(game_key, 0) + net_lost
+        stats["totals"]["lost"] += net_lost
+        if net_lost > stats["max_loss"]["amount"]:
+            stats["max_loss"] = {"amount": net_lost, "game": g}
+    await _save_user_stats(user_id, chat_id, stats)
+
+
+async def stats_record_rob_attempt(user_id: int, chat_id: int) -> None:
+    stats = await get_user_stats(user_id, chat_id)
+    stats["rob"]["attempts"] += 1
+    await _save_user_stats(user_id, chat_id, stats)
+
+
+async def stats_record_rob_success_robber(user_id: int, chat_id: int, stolen: int) -> None:
+    stats = await get_user_stats(user_id, chat_id)
+    stats["rob"]["success"] += 1
+    stats["rob"]["stolen_as_robber"] += max(0, stolen)
+    await _save_user_stats(user_id, chat_id, stats)
+
+
+async def stats_record_rob_fine(user_id: int, chat_id: int, fine: int) -> None:
+    stats = await get_user_stats(user_id, chat_id)
+    stats["rob"]["fines_paid"] += max(0, fine)
+    await _save_user_stats(user_id, chat_id, stats)
+
+
+async def stats_record_rob_victim(user_id: int, chat_id: int, stolen: int) -> None:
+    stats = await get_user_stats(user_id, chat_id)
+    stats["rob"]["stolen_from_victim"] += max(0, stolen)
+    await _save_user_stats(user_id, chat_id, stats)
+
+
+async def stats_record_chest(user_id: int, chat_id: int, reward: int) -> None:
+    stats = await get_user_stats(user_id, chat_id)
+    stats["chest"]["opened"] += 1
+    stats["chest"]["mimriks"] += max(0, reward)
+    await _save_user_stats(user_id, chat_id, stats)
+
+
+async def stats_record_transfer_sent(user_id: int, chat_id: int, amount: int) -> None:
+    stats = await get_user_stats(user_id, chat_id)
+    stats["transfer"]["sent"] += max(0, amount)
+    await _save_user_stats(user_id, chat_id, stats)
+
+
+# --- Ежедневные задания ---
+
+
+def today_str() -> str:
+    return date.today().isoformat()
+
+
+async def _get_daily_row(user_id: int, chat_id: int, day: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        cursor = await db.execute(
+            """
+            SELECT coinflip_count, rob_success, roulette_wins, mines_plays,
+                   reward_coinflip, reward_rob, reward_roulette, reward_mines
+            FROM daily_quest_state
+            WHERE user_id = ? AND chat_id = ? AND day = ?
+            """,
+            (user_id, chat_id, day),
+        )
+        return await cursor.fetchone()
+
+
+async def _ensure_daily_row(user_id: int, chat_id: int, day: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            """
+            INSERT OR IGNORE INTO daily_quest_state(
+                user_id, chat_id, day,
+                coinflip_count, rob_success, roulette_wins, mines_plays,
+                reward_coinflip, reward_rob, reward_roulette, reward_mines
+            ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
+            """,
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+
+
+async def daily_quest_bump_coinflip(user_id: int, chat_id: int, reward_amount: int, target: int) -> int:
+    """+1 к счётчику coinflip (ставка уже проверена). Возвращает начисленную награду (0 или reward_amount)."""
+    day = today_str()
+    await _ensure_daily_row(user_id, chat_id, day)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE daily_quest_state SET coinflip_count = coinflip_count + 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+    row = await _get_daily_row(user_id, chat_id, day)
+    if not row:
+        return 0
+    cnt, _, _, _, r_cf, _, _, _ = row
+    if r_cf or cnt < target:
+        return 0
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE daily_quest_state SET reward_coinflip = 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+    return reward_amount
+
+
+async def daily_quest_bump_rob_success(user_id: int, chat_id: int, reward_amount: int, target: int) -> int:
+    day = today_str()
+    await _ensure_daily_row(user_id, chat_id, day)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE daily_quest_state SET rob_success = rob_success + 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+    row = await _get_daily_row(user_id, chat_id, day)
+    if not row:
+        return 0
+    _, rob_ok, _, _, _, r_rob, _, _ = row
+    if r_rob or rob_ok < target:
+        return 0
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE daily_quest_state SET reward_rob = 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+    return reward_amount
+
+
+async def daily_quest_bump_roulette_win(user_id: int, chat_id: int, reward_amount: int, target: int) -> int:
+    day = today_str()
+    await _ensure_daily_row(user_id, chat_id, day)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE daily_quest_state SET roulette_wins = roulette_wins + 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+    row = await _get_daily_row(user_id, chat_id, day)
+    if not row:
+        return 0
+    _, _, rw, _, _, _, r_r, _ = row
+    if r_r or rw < target:
+        return 0
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE daily_quest_state SET reward_roulette = 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+    return reward_amount
+
+
+async def daily_quest_bump_mines_play(user_id: int, chat_id: int, reward_amount: int, target: int) -> int:
+    day = today_str()
+    await _ensure_daily_row(user_id, chat_id, day)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE daily_quest_state SET mines_plays = mines_plays + 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+    row = await _get_daily_row(user_id, chat_id, day)
+    if not row:
+        return 0
+    mines_cnt = row[3]
+    r_m = row[7]
+    if r_m or mines_cnt < target:
+        return 0
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE daily_quest_state SET reward_mines = 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+    return reward_amount
+
+
+async def get_daily_quest_snapshot(user_id: int, chat_id: int) -> dict[str, Any]:
+    day = today_str()
+    await _ensure_daily_row(user_id, chat_id, day)
+    row = await _get_daily_row(user_id, chat_id, day)
+    if not row:
+        return {
+            "day": day,
+            "coinflip_count": 0,
+            "rob_success": 0,
+            "roulette_wins": 0,
+            "mines_plays": 0,
+            "reward_coinflip": 0,
+            "reward_rob": 0,
+            "reward_roulette": 0,
+            "reward_mines": 0,
+        }
+    (
+        coinflip_count,
+        rob_success,
+        roulette_wins,
+        mines_plays,
+        reward_coinflip,
+        reward_rob,
+        reward_roulette,
+        reward_mines,
+    ) = row
+    return {
+        "day": day,
+        "coinflip_count": coinflip_count,
+        "rob_success": rob_success,
+        "roulette_wins": roulette_wins,
+        "mines_plays": mines_plays,
+        "reward_coinflip": reward_coinflip,
+        "reward_rob": reward_rob,
+        "reward_roulette": reward_roulette,
+        "reward_mines": reward_mines,
+    }

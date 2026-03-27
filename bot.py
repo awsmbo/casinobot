@@ -1,5 +1,7 @@
 import asyncio
+import hashlib
 import random
+import secrets
 import time
 
 from aiogram import Bot, Dispatcher, types, F
@@ -26,19 +28,51 @@ dp = Dispatcher()
 # Состояние для раундов (chat_id -> message_id для редактирования)
 round_messages_cache = {}
 
-# Rocket: (chat_id, user_id) -> {"amount": int, "multiplier": float, "active": bool, "message_id": int}
-rocket_games = {}
-
 # Roulette: chat_id -> {"active": bool, "end_ts": float, "message_id": int, "bets": [...]}
 roulette_rounds = {}
 
 # Сапёр: (chat_id, user_id) -> состояние игры
 mines_games = {}
 
-# 5 коэффициентов по порядку открытия (каждый больше предыдущего), произведение ≈ ×50.5
-MINES_MULTS = [1.2, 1.45, 1.8, 2.6, 6.2]
-MINES_SAFE = 5
-MINES_GRID = 16
+MINES_GRID_SIDE = 5
+MINES_GRID = MINES_GRID_SIDE * MINES_GRID_SIDE  # 25
+MINES_MIN_COUNT = 1
+MINES_MAX_COUNT = 24
+# 8 множителей: m1=1.2, m2..m8 одинаковые, произведение = 100
+MINES_MULT_FIRST = 1.2
+MINES_MULT_STEP = (100.0 / MINES_MULT_FIRST) ** (1.0 / 7.0)
+MINES_MULTIPLIERS = [MINES_MULT_FIRST] + [MINES_MULT_STEP] * 7
+
+DAILY_MIN_BET = 1000
+DAILY_QUEST_REWARD = 10_000
+DAILY_COINFLIP_PLAYS = 50
+DAILY_ROB_SUCCESS = 1
+DAILY_ROULETTE_WINS = 10
+DAILY_MINES_PLAYS = 10
+
+
+def _mines_cumulative_multiplier(safe_opened: int) -> float:
+    if safe_opened <= 0:
+        return 0.0
+    n = min(safe_opened, 8)
+    p = 1.0
+    for i in range(n):
+        p *= MINES_MULTIPLIERS[i]
+    return p
+
+
+def _slot_multiplier_and_label(value: int) -> tuple[float, str]:
+    if value == 64:
+        return 50.0, "Джекпот ×50"
+    if 61 <= value <= 63:
+        return 10.0, "×10"
+    if 55 <= value <= 60:
+        return 5.0, "×5"
+    if 52 <= value <= 54:
+        return 3.0, "×3"
+    if 33 <= value <= 51:
+        return 1.2, "×1.2"
+    return 0.0, "Проигрыш"
 
 
 @dp.my_chat_member()
@@ -146,7 +180,7 @@ def _private_instructions() -> str:
         "3. Делайте ставки: /bet 100\n"
         "4. Когда все готовы — нажмите кнопку «Запустить» под сообщением со ставками\n"
         "5. Победитель определяется случайно (чем больше ставка — тем выше шанс)\n\n"
-        "Другие команды: /transfer, /coinflip, /mines, /rob, /leaderboard\n"
+        "Другие команды: /transfer, /coinflip, /slot, /mines, /rob, /stats, /daily, /leaderboard\n"
         "Сундуки появляются случайно!\n\n"
         f"🔗 Исходный код: {GITHUB_URL}"
     )
@@ -183,9 +217,11 @@ async def help_cmd(message: types.Message):
         "/bank — текущий банк раунда\n"
         "/transfer @user <сумма> — передать мимрики другому игроку\n"
         "/coinflip <сумма> — 50/50: проиграть или удвоить\n"
-        "/mines <сумма> — сапёр: 4×4, множители или бомба\n"
-        "/rocket <сумма> — игра с растущим множителем и риском взрыва\n"
+        "/mines <ставка> — сапёр 5×5: 8 множителей (макс. ×100)\n"
+        "/slot <ставка> — слот (куб 🎰)\n"
         "/rob @user — попытаться украсть мимрики (10% шанс, 1 раз в 30 мин)\n"
+        "/stats — ваша статистика\n"
+        "/daily — ежедневные задания\n"
         "/leaderboard — топ игроков\n"
         "Сундуки появляются случайно в чате!"
     )
@@ -377,6 +413,7 @@ async def transfer(message: types.Message):
 
     await db.change_balance(from_id, chat_id, -amount)
     await db.change_balance(target_id, chat_id, amount)
+    await db.stats_record_transfer_sent(from_id, chat_id, amount)
 
     w = mimriks(amount)
     target_name = target_text or (message.reply_to_message.from_user.username or message.reply_to_message.from_user.first_name)
@@ -419,86 +456,361 @@ async def coinflip(message: types.Message):
 
     if random.random() < 0.5:
         await db.change_balance(user_id, chat_id, amount * 2)
+        await db.stats_record_game(user_id, chat_id, "coinflip", net_won=amount, net_lost=0)
+        if amount >= DAILY_MIN_BET:
+            r = await db.daily_quest_bump_coinflip(
+                user_id, chat_id, DAILY_QUEST_REWARD, DAILY_COINFLIP_PLAYS
+            )
+            if r:
+                await db.change_balance(user_id, chat_id, r)
         bal = await db.get_balance(user_id, chat_id)
         w = mimriks(amount * 2)
         await message.reply(f"🪙 Орёл! Вы выиграли {amount * 2} {w}!\n"
         f"Ваш баланс: {bal} {mimriks(bal)}")
     else:
+        await db.stats_record_game(user_id, chat_id, "coinflip", net_won=0, net_lost=amount)
+        if amount >= DAILY_MIN_BET:
+            r = await db.daily_quest_bump_coinflip(
+                user_id, chat_id, DAILY_QUEST_REWARD, DAILY_COINFLIP_PLAYS
+            )
+            if r:
+                await db.change_balance(user_id, chat_id, r)
         bal = await db.get_balance(user_id, chat_id)
         w = mimriks(amount)
         await message.reply(f"🪙 Решка. Вы проиграли {amount} {w}.\n"
         f"Ваш баланс: {bal} {mimriks(bal)}")
 
 
+@dp.message(Command("slot"))
+async def slot_cmd(message: types.Message):
+    if not await _thread_allowed(message):
+        return
+    args = (message.text or "").split()
+    if len(args) != 2:
+        await message.reply("Использование: /slot <сумма>")
+        return
+    try:
+        amount = int(args[1])
+    except ValueError:
+        await message.reply("Сумма должна быть числом.")
+        return
+    if amount < 1:
+        await message.reply("Минимальная ставка — 1 мимрик.")
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    bal = await db.get_balance(user_id, chat_id)
+    if bal is None:
+        await message.reply("Сначала /registration")
+        return
+    if amount > bal:
+        await message.reply(f"Недостаточно {mimriks(amount)}.")
+        return
+
+    await db.change_balance(user_id, chat_id, -amount)
+    dice_msg = await message.answer_dice(emoji="🎰")
+    val = dice_msg.dice.value if dice_msg.dice else 0
+    mult, label = _slot_multiplier_and_label(val)
+
+    if mult <= 0:
+        await db.stats_record_game(user_id, chat_id, "slot", net_won=0, net_lost=amount)
+        bal2 = await db.get_balance(user_id, chat_id)
+        await message.reply(
+            f"🎰 Выпало значение {val}. {label}.\n"
+            f"Ставка {amount} {mimriks(amount)} проиграна.\n"
+            f"Баланс: {bal2} {mimriks(bal2)}"
+        )
+        return
+
+    gross = int(amount * mult)
+    await db.change_balance(user_id, chat_id, gross)
+    profit = gross - amount
+    await db.stats_record_game(user_id, chat_id, "slot", net_won=max(0, profit), net_lost=0)
+    bal2 = await db.get_balance(user_id, chat_id)
+    await message.reply(
+        f"🎰 Выпало {val}. {label}\n"
+        f"Выплата: {gross} {mimriks(gross)} (чистыми +{profit}).\n"
+        f"Баланс: {bal2} {mimriks(bal2)}"
+    )
+
+
+def _format_user_stats_text(s: dict) -> str:
+    plays = s.get("plays") or {}
+    won = s.get("won") or {}
+    lost = s.get("lost") or {}
+    totals = s.get("totals") or {}
+    mxw = s.get("max_win") or {}
+    mxl = s.get("max_loss") or {}
+    rob = s.get("rob") or {}
+    chest = s.get("chest") or {}
+    transfer = s.get("transfer") or {}
+
+    def line(game: str, title: str) -> str:
+        p = plays.get(game, 0)
+        wn = won.get(game, 0)
+        ls = lost.get(game, 0)
+        return f"• {title}: игр {p}; выиграно {wn}; проиграно {ls}"
+
+    lines = [
+        "📊 Статистика (этот чат)\n",
+        "Игры:",
+        line("round", "Раунд ставок"),
+        line("coinflip", "Coinflip"),
+        line("mines", "Сапёр"),
+        line("roulette", "Рулетка"),
+        line("slot", "Слот"),
+        "",
+        f"Всего выиграно (нетто по играм): {totals.get('won', 0)}",
+        f"Всего проиграно: {totals.get('lost', 0)}",
+        "",
+        f"Рекорд выигрыша: {mxw.get('amount', 0)} ({mxw.get('game', '—')})",
+        f"Рекорд проигрыша: {mxl.get('amount', 0)} ({mxl.get('game', '—')})",
+        "",
+        "Ограбления:",
+        f"• Попыток: {rob.get('attempts', 0)}, успешных: {rob.get('success', 0)}",
+        f"• Украдено вами: {rob.get('stolen_as_robber', 0)}",
+        f"• Штрафов уплачено: {rob.get('fines_paid', 0)}",
+        f"• У вас украли (жертва): {rob.get('stolen_from_victim', 0)}",
+        "",
+        f"Сундуки: открыто {chest.get('opened', 0)}, всего из сундуков {chest.get('mimriks', 0)}",
+        f"Переводы (/transfer): {transfer.get('sent', 0)} отправлено",
+    ]
+    return "\n".join(lines)
+
+
+@dp.message(Command("stats"))
+async def stats_cmd(message: types.Message):
+    if not await _thread_allowed(message):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    if await db.get_balance(user_id, chat_id) is None:
+        await message.reply("Сначала /registration")
+        return
+    s = await db.get_user_stats(user_id, chat_id)
+    await message.reply(_format_user_stats_text(s))
+
+
+def _format_daily_quests_text(q: dict) -> str:
+    def row(done: bool, cur: int, target: int, title: str, note: str) -> str:
+        em = "✅" if done else "⬜"
+        return f"{em} {title}\n   {min(cur, target)}/{target} — {note}"
+
+    rc = q.get("reward_coinflip")
+    rr = q.get("reward_rob")
+    rrw = q.get("reward_roulette")
+    rm = q.get("reward_mines")
+
+    lines = [
+        f"📅 Ежедневные задания ({q.get('day', '')})\n"
+        f"Для зачёта в играх ставка от {DAILY_MIN_BET} {mimriks(DAILY_MIN_BET)}.\n",
+        row(
+            bool(rc),
+            q.get("coinflip_count", 0),
+            DAILY_COINFLIP_PLAYS,
+            f"Сыграть в /coinflip {DAILY_COINFLIP_PLAYS} раз",
+            f"награда {DAILY_QUEST_REWARD}",
+        ),
+        row(
+            bool(rr),
+            min(q.get("rob_success", 0), DAILY_ROB_SUCCESS),
+            DAILY_ROB_SUCCESS,
+            "Успешно ограбить",
+            f"награда {DAILY_QUEST_REWARD}",
+        ),
+        row(
+            bool(rrw),
+            q.get("roulette_wins", 0),
+            DAILY_ROULETTE_WINS,
+            f"Выиграть в /roulette {DAILY_ROULETTE_WINS} раз",
+            f"награда {DAILY_QUEST_REWARD}",
+        ),
+        row(
+            bool(rm),
+            q.get("mines_plays", 0),
+            DAILY_MINES_PLAYS,
+            f"Сыграть в /mines {DAILY_MINES_PLAYS} раз",
+            f"награда {DAILY_QUEST_REWARD}",
+        ),
+    ]
+    return "\n".join(lines)
+
+
+@dp.message(Command("daily"))
+async def daily_cmd(message: types.Message):
+    if not await _thread_allowed(message):
+        return
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    if await db.get_balance(user_id, chat_id) is None:
+        await message.reply("Сначала /registration")
+        return
+    q = await db.get_daily_quest_snapshot(user_id, chat_id)
+    await message.reply(_format_daily_quests_text(q))
+
+
+def _mines_layout_from_seed(server_seed: str, game_salt: str, n_mines: int) -> set[int]:
+    digest = hashlib.sha256(f"{server_seed}|{game_salt}|{n_mines}".encode()).hexdigest()
+    rng = random.Random(int(digest[:16], 16))
+    positions = list(range(MINES_GRID))
+    rng.shuffle(positions)
+    return set(positions[:n_mines])
+
+
+def _mines_pick_text(amount: int) -> str:
+    m1 = MINES_MULT_FIRST
+    mrest = MINES_MULT_STEP
+    return (
+        "💣 Сапёр 5×5\n\n"
+        f"Ставка: {amount} {mimriks(amount)}\n"
+        f"8 множителей: ×{m1:g} и далее ×{mrest:.4f} (×7), итоговый макс. ×100.\n\n"
+        "Выберите число мин на поле (1–24). "
+        "Больше мин — выше риск.\n\n"
+        "После выбора спишется ставка и сгенерируется поле. "
+        "Честность: после игры будет показан seed для проверки SHA256."
+    )
+
+
+def _mines_pick_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for r in range(4):
+        row_btns = []
+        for c in range(6):
+            n = r * 6 + c + 1
+            if n > MINES_MAX_COUNT:
+                break
+            row_btns.append(InlineKeyboardButton(text=str(n), callback_data=f"ms_p_{n}"))
+        if row_btns:
+            builder.row(*row_btns)
+    return builder.as_markup()
+
+
+def _mines_field_lines(state: dict, *, reveal_all: bool) -> str:
+    mine_cells = state.get("mine_cells") or set()
+    revealed = state.get("revealed") or set()
+    rows = []
+    for r in range(MINES_GRID_SIDE):
+        cells = []
+        for c in range(MINES_GRID_SIDE):
+            i = r * MINES_GRID_SIDE + c
+            if not reveal_all and i not in revealed:
+                cells.append("▢")
+            elif i in mine_cells:
+                cells.append("💣")
+            else:
+                cells.append("·")
+        rows.append(" ".join(cells))
+    return "\n".join(rows)
+
+
 def _mines_game_text(state: dict, *, over: bool = False, win: bool = False) -> str:
     amount = state["amount"]
-    product = state["product"]
     safe_opened = state["safe_opened"]
-    win_amt = int(amount * product)
+    total_safe = state["total_safe"]
+    n_mines = state["mines_count"]
+    mult = _mines_cumulative_multiplier(safe_opened)
+    win_amt = int(amount * mult) if safe_opened > 0 else 0
+    seed_hash = state.get("server_seed_hash", "")
+
+    verify_tail = ""
+    if over and state.get("server_seed"):
+        verify_tail = (
+            f"\n\n🔐 Provably fair\n"
+            f"seed: <code>{state['server_seed']}</code>\n"
+            f"SHA256: <code>{hashlib.sha256(state['server_seed'].encode()).hexdigest()}</code>"
+        )
+
+    field_block = ""
+    if over and state.get("phase") == "play":
+        field_block = "\n\nПоле:\n" + _mines_field_lines(state, reveal_all=True)
 
     if over and not win:
         return (
-            "💥 Бомба! Ставка проиграна.\n\n"
+            "💥 Мина! Ставка проиграна.\n\n"
             f"Ставка: {amount} {mimriks(amount)}\n"
-            f"До взрыва открыто множителей: {safe_opened}/{MINES_SAFE}\n"
-            f"Множитель был: ×{product:.2f}"
+            f"Мин на поле: {n_mines}\n"
+            f"Открыто безопасных до взрыва: {safe_opened}/{total_safe}\n"
+            f"Множитель был: ×{mult:.2f}"
+            + field_block
+            + verify_tail
         )
 
     if over and win:
         return (
-            "🎉 Поздравляем!\n\n"
-            f"Вы забрали {win_amt} {mimriks(win_amt)}.\n"
-            f"Итоговый множитель: ×{product:.2f} ({safe_opened} из {MINES_SAFE})"
+            "🎉 Вы забрали выигрыш!\n\n"
+            f"Выплата: {win_amt} {mimriks(win_amt)}\n"
+            f"Множитель: ×{mult:.2f} ({safe_opened}/{total_safe} безопасных)\n"
+            f"Мин: {n_mines}"
+            + field_block
+            + verify_tail
         )
 
     lines = [
-        "💣 Сапёр",
+        "💣 Сапёр 5×5",
         "",
-        f"Ставка: {amount} {mimriks(amount)}",
-        f"Текущий множитель: ×{product:.2f}",
-        f"Можно забрать сейчас: {win_amt} {mimriks(win_amt)}",
+        f"Ставка: {amount} {mimriks(amount)} · Мин: {n_mines} · Безопасных: {total_safe}",
+        f"SHA256(seed) до раскрытия: <code>{seed_hash}</code>",
         "",
-        f"Открыто множителей: {safe_opened}/{MINES_SAFE}",
+        f"Открыто безопасных: {safe_opened}/{total_safe}",
+        f"Шаг множителя: {min(safe_opened, 8)}/8 (макс. ×100)",
     ]
-    if safe_opened == 0:
-        lines.append("Откройте клетку. После первого множителя появится кнопка «Забрать приз».")
+    if safe_opened > 0:
+        lines.append(f"Множитель: ×{mult:.2f}")
+        lines.append(f"Забрать сейчас: {win_amt} {mimriks(win_amt)}")
     else:
-        lines.append("Дальше — только клетки с «▢» или заберите приз.")
+        lines.append("Множитель появится после первой безопасной клетки.")
+    lines.append("")
+    lines.append("Открывайте по одной клетке или нажмите «Забрать».")
     return "\n".join(lines)
 
 
 def _mines_build_keyboard(state: dict) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
-    safe_cells = state["safe_cells"]
+    mine_cells = state["mine_cells"]
     revealed = state["revealed"]
-    revealed_mults = state["revealed_mults"]
     active = state["active"]
 
-    for row in range(4):
+    for row in range(MINES_GRID_SIDE):
         row_btns = []
-        for col in range(4):
-            idx = row * 4 + col
+        for col in range(MINES_GRID_SIDE):
+            idx = row * MINES_GRID_SIDE + col
             if idx in revealed:
-                if idx in revealed_mults:
-                    m = revealed_mults[idx]
-                    label = f"×{m:.2f}"
-                else:
+                if idx in mine_cells:
                     label = "💥"
-                row_btns.append(
-                    InlineKeyboardButton(text=label, callback_data="ms_n")
-                )
+                else:
+                    label = "✓"
+                row_btns.append(InlineKeyboardButton(text=label, callback_data="ms_n"))
             else:
-                row_btns.append(
-                    InlineKeyboardButton(text="▢", callback_data=f"ms_o_{idx}")
-                )
+                row_btns.append(InlineKeyboardButton(text="▢", callback_data=f"ms_o_{idx}"))
         builder.row(*row_btns)
 
     if active and state["safe_opened"] >= 1:
-        builder.row(
-            InlineKeyboardButton(text="💰 Забрать приз", callback_data="ms_c"),
-        )
+        builder.row(InlineKeyboardButton(text="💰 Забрать", callback_data="ms_c"))
 
     return builder.as_markup()
+
+
+async def _mines_record_end(
+    user_id: int,
+    chat_id: int,
+    amount: int,
+    *,
+    won: bool,
+    payout: int,
+) -> None:
+    """Статистика и ежедневное задание после завершения партии сапёра."""
+    if won:
+        profit = max(0, payout - amount)
+        await db.stats_record_game(user_id, chat_id, "mines", net_won=profit, net_lost=0)
+    else:
+        await db.stats_record_game(user_id, chat_id, "mines", net_won=0, net_lost=amount)
+    if amount >= DAILY_MIN_BET:
+        r = await db.daily_quest_bump_mines_play(
+            user_id, chat_id, DAILY_QUEST_REWARD, DAILY_MINES_PLAYS
+        )
+        if r:
+            await db.change_balance(user_id, chat_id, r)
 
 
 async def _mines_finish(
@@ -518,6 +830,7 @@ async def _mines_finish(
             message_id=message_id,
             text=text,
             reply_markup=None,
+            parse_mode="HTML",
         )
     except Exception:
         pass
@@ -525,7 +838,7 @@ async def _mines_finish(
 
 @dp.message(Command("mines"))
 async def mines_cmd(message: types.Message):
-    """Игра «Сапёр»: 4×4 клеток, 5 множителей, 11 бомб. /mines <ставка>"""
+    """Сапёр 5×5: /mines <ставка>, затем выбор числа мин."""
     if not await _thread_allowed(message):
         await message.reply("Используйте /mines в нужной теме чата (если в группе есть темы).")
         return
@@ -546,8 +859,9 @@ async def mines_cmd(message: types.Message):
     user_id = message.from_user.id
     key = (chat_id, user_id)
 
-    if key in mines_games and mines_games[key].get("active"):
-        await message.reply("У вас уже идёт игра в сапёра. Сначала закончите её.")
+    existing = mines_games.get(key)
+    if existing and existing.get("active") and existing.get("phase") == "play":
+        await message.reply("У вас уже идёт партия сапёра. Сначала закончите её.")
         return
 
     bal = await db.get_balance(user_id, chat_id)
@@ -558,24 +872,17 @@ async def mines_cmd(message: types.Message):
         await message.reply(f"Недостаточно {mimriks(amount)}.")
         return
 
-    await db.change_balance(user_id, chat_id, -amount)
+    if existing:
+        mines_games.pop(key, None)
 
-    safe_cells = set(random.sample(range(MINES_GRID), MINES_SAFE))
     state = {
+        "phase": "pick_mines",
         "amount": amount,
         "owner_id": user_id,
-        "safe_cells": safe_cells,
-        "revealed": set(),
-        "revealed_mults": {},
-        "safe_opened": 0,
-        "product": 1.0,
         "active": True,
         "message_id": 0,
     }
-
-    text = _mines_game_text(state)
-    kb = _mines_build_keyboard(state)
-    msg = await message.reply(text, reply_markup=kb)
+    msg = await message.reply(_mines_pick_text(amount), reply_markup=_mines_pick_keyboard())
     state["message_id"] = msg.message_id
     mines_games[key] = state
 
@@ -589,7 +896,6 @@ async def mines_callback(callback: CallbackQuery):
 
     state = mines_games.get(key)
     if not state or not state.get("active"):
-        # Сообщение сапёра могло быть от другого игрока
         for (c, owner_id), st in mines_games.items():
             if c == chat_id and st.get("message_id") == mid and st.get("active"):
                 if owner_id != user_id:
@@ -613,12 +919,75 @@ async def mines_callback(callback: CallbackQuery):
         await callback.answer()
         return
 
+    # --- выбор числа мин ---
+    if state.get("phase") == "pick_mines":
+        if not data.startswith("ms_p_"):
+            await callback.answer("Сначала выберите число мин кнопками ниже.", show_alert=True)
+            return
+        try:
+            n_mines = int(data[5:])
+        except ValueError:
+            await callback.answer()
+            return
+        if n_mines < MINES_MIN_COUNT or n_mines > MINES_MAX_COUNT:
+            await callback.answer("Неверное число мин.", show_alert=True)
+            return
+
+        amount = state["amount"]
+        bal = await db.get_balance(user_id, chat_id)
+        if bal is None or amount > bal:
+            mines_games.pop(key, None)
+            await callback.answer("Недостаточно средств для ставки.", show_alert=True)
+            try:
+                await callback.message.edit_text("Игра отменена: недостаточно мимриков.", reply_markup=None)
+            except Exception:
+                pass
+            return
+
+        await db.change_balance(user_id, chat_id, -amount)
+
+        server_seed = secrets.token_hex(16)
+        server_seed_hash = hashlib.sha256(server_seed.encode()).hexdigest()
+        game_salt = f"{chat_id}:{user_id}:{mid}:{n_mines}"
+        mine_cells = _mines_layout_from_seed(server_seed, game_salt, n_mines)
+        total_safe = MINES_GRID - n_mines
+
+        state.update(
+            {
+                "phase": "play",
+                "mines_count": n_mines,
+                "mine_cells": mine_cells,
+                "total_safe": total_safe,
+                "revealed": set(),
+                "safe_opened": 0,
+                "server_seed": server_seed,
+                "server_seed_hash": server_seed_hash,
+                "game_salt": game_salt,
+            }
+        )
+
+        text = _mines_game_text(state)
+        kb = _mines_build_keyboard(state)
+        try:
+            await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
+        except Exception:
+            pass
+        await callback.answer(f"Мин: {n_mines}. Удачи!")
+        return
+
+    # --- игра ---
+    if state.get("phase") != "play":
+        await callback.answer("Игра не активна.", show_alert=True)
+        return
+
     if data == "ms_c":
         if state["safe_opened"] < 1:
-            await callback.answer("Сначала откройте хотя бы одну клетку с множителем.", show_alert=True)
+            await callback.answer("Сначала откройте хотя бы одну безопасную клетку.", show_alert=True)
             return
-        win = int(state["amount"] * state["product"])
+        mult = _mines_cumulative_multiplier(state["safe_opened"])
+        win = int(state["amount"] * mult)
         await db.change_balance(user_id, chat_id, win)
+        await _mines_record_end(user_id, chat_id, state["amount"], won=True, payout=win)
         await _mines_finish(chat_id, state["message_id"], key, state, win=True)
         await callback.answer(f"Забрали {win} {mimriks(win)}!")
         return
@@ -628,7 +997,7 @@ async def mines_callback(callback: CallbackQuery):
         return
 
     try:
-        idx = int(data[5:])  # после "ms_o_"
+        idx = int(data[5:])
     except ValueError:
         await callback.answer()
         return
@@ -638,33 +1007,33 @@ async def mines_callback(callback: CallbackQuery):
         return
 
     state["revealed"].add(idx)
+    mine_cells = state["mine_cells"]
 
-    if idx not in state["safe_cells"]:
-        # Бомба
+    if idx in mine_cells:
+        await _mines_record_end(user_id, chat_id, state["amount"], won=False, payout=0)
         await _mines_finish(chat_id, state["message_id"], key, state, win=False)
-        await callback.answer("💥 Бомба!", show_alert=True)
+        await callback.answer("💥 Мина!", show_alert=True)
         return
 
-    # Множитель по порядку открытия безопасных клеток
-    mult = MINES_MULTS[state["safe_opened"]]
-    state["revealed_mults"][idx] = mult
     state["safe_opened"] += 1
-    state["product"] *= mult
+    total_safe = state["total_safe"]
 
-    if state["safe_opened"] >= MINES_SAFE:
-        # Все 5 множителей — автоматический максимальный выигрыш
-        win = int(state["amount"] * state["product"])
+    if state["safe_opened"] >= total_safe:
+        mult = _mines_cumulative_multiplier(state["safe_opened"])
+        win = int(state["amount"] * mult)
         await db.change_balance(user_id, chat_id, win)
+        await _mines_record_end(user_id, chat_id, state["amount"], won=True, payout=win)
         await _mines_finish(chat_id, state["message_id"], key, state, win=True)
-        await callback.answer(f"Джекпот! +{win} {mimriks(win)}!")
+        await callback.answer(f"Все клетки! +{win} {mimriks(win)}!")
         return
 
     text = _mines_game_text(state)
     kb = _mines_build_keyboard(state)
     try:
-        await callback.message.edit_text(text=text, reply_markup=kb)
+        await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
     except Exception:
         pass
+    mult = _mines_cumulative_multiplier(state["safe_opened"])
     await callback.answer(f"×{mult:.2f}")
 
 
@@ -783,6 +1152,15 @@ async def _roulette_round_runner(chat_id: int):
         if win > 0:
             await db.change_balance(uid, chat_id, win)
             user_wins[uid] = user_wins.get(uid, 0) + win
+            await db.stats_record_game(uid, chat_id, "roulette", net_won=win, net_lost=0)
+            if amount >= DAILY_MIN_BET:
+                r = await db.daily_quest_bump_roulette_win(
+                    uid, chat_id, DAILY_QUEST_REWARD, DAILY_ROULETTE_WINS
+                )
+                if r:
+                    await db.change_balance(uid, chat_id, r)
+        else:
+            await db.stats_record_game(uid, chat_id, "roulette", net_won=0, net_lost=amount)
 
         # Получаем отображаемое имя пользователя
         try:
@@ -974,223 +1352,6 @@ async def roulette(message: types.Message):
         f"Результат будет после окончания раунда."
     )
 
-# --- Ракета ---
-# Краш-мультипликатор: r ~ U(0,1), crash = min(10, 1/(1-r)) — тяжёлый хвост.
-# Длительность полёта T ~ U[T_MIN, T_MAX] задаётся НЕЗАВИСИМО от crash_point,
-# чтобы по «скорости» роста нельзя было угадать высоту краша.
-# Отображение: mult(t) = crash_point^((t/T)^p), p>1 — плавный старт, ускорение к концу.
-
-
-def _generate_crash_multiplier() -> float:
-    """
-    Генерирует множитель краша по модели crash-игр (Bustabit/Stake).
-    r ~ U(0, 1) → multiplier = 1/(1-r), ограничен 10.00x, округление до 2 знаков.
-    Распределение с тяжёлым хвостом: малые множители частые, большие редкие.
-    """
-    r = random.random()  # [0, 1)
-    if r >= 0.9999:
-        r = 0.9999
-    return round(min(10.0, 1.0 / (1.0 - r)), 2)
-
-
-# Длительность анимации (сек) — случайная, не связана с crash_point
-ROCKET_DURATION_MIN = 5.0
-ROCKET_DURATION_MAX = 11.0
-ROCKET_TICK = 1.0
-ROCKET_CURVE_P = 1.35
-
-
-@dp.message(Command("rocket"))
-async def rocket(message: types.Message):
-    if not await _thread_allowed(message):
-        await message.reply("Используйте /rocket в нужной теме чата (если в группе есть темы).")
-        return
-    args = (message.text or "").split()
-    if len(args) != 2:
-        await message.reply("Использование: /rocket <сумма>")
-        return
-
-    try:
-        amount = int(args[1])
-    except ValueError:
-        await message.reply("Сумма должна быть числом.")
-        return
-
-    if amount < 1:
-        await message.reply("Минимальная ставка — 1 мимрик.")
-        return
-
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    key = (chat_id, user_id)
-
-    if key in rocket_games and rocket_games[key].get("active"):
-        await message.reply("У вас уже запущена ракета. Дождитесь окончания игры.")
-        return
-
-    bal = await db.get_balance(user_id, chat_id)
-    if bal is None:
-        await message.reply("Сначала /registration")
-        return
-
-    if amount > bal:
-        await message.reply(f"Недостаточно {mimriks(amount)}.")
-        return
-
-    await db.change_balance(user_id, chat_id, -amount)
-
-    crash_point = _generate_crash_multiplier()
-    duration = random.uniform(ROCKET_DURATION_MIN, ROCKET_DURATION_MAX)
-
-    kb = InlineKeyboardBuilder()
-    kb.add(InlineKeyboardButton(text="Забрать", callback_data="rocket_stop"))
-
-    intro = (
-        "🚀 Ракета взлетает!\n"
-        f"Ставка: {amount} {mimriks(amount)}\n"
-        f"Множитель: 1.00x\n\n"
-        "Рост по фиксированной кривой до случайного краша (макс. 10.00x). "
-        "Длительность полёта не подсказывает, на каком множителе будет взрыв.\n\n"
-        "Нажмите «Забрать», чтобы забрать выигрыш."
-    )
-    msg = await message.reply(intro, reply_markup=kb.as_markup())
-
-    rocket_games[key] = {
-        "amount": amount,
-        "multiplier": 1.0,
-        "active": True,
-        "message_id": msg.message_id,
-        "crash_point": crash_point,
-        "duration": duration,
-        "flight_epoch": 0,
-        "finalized": False,
-    }
-
-    asyncio.create_task(_rocket_flight(chat_id, user_id))
-
-
-async def _rocket_flight(chat_id: int, user_id: int):
-    key = (chat_id, user_id)
-    state = rocket_games.get(key)
-    if not state or not state["active"]:
-        return
-
-    epoch_at_start = state["flight_epoch"]
-    amount = state["amount"]
-    crash_point = state["crash_point"]
-    duration = state["duration"]
-    p = ROCKET_CURVE_P
-    t = 0.0
-
-    def _aborted() -> bool:
-        st = rocket_games.get(key)
-        if st is not state:
-            return True
-        if st.get("flight_epoch") != epoch_at_start:
-            return True
-        if st.get("finalized"):
-            return True
-        return False
-
-    while state.get("active") and t < duration:
-        await asyncio.sleep(ROCKET_TICK)
-        if _aborted():
-            return
-
-        t += ROCKET_TICK
-        progress = min(1.0, t / duration)
-        current_mult = crash_point ** (progress**p)
-        current_mult = min(current_mult, crash_point)
-        current_mult = round(current_mult, 2)
-        state["multiplier"] = current_mult
-
-        if _aborted():
-            return
-
-        if t >= duration:
-            if _aborted():
-                return
-            state["active"] = False
-            state["finalized"] = True
-            text = (
-                "🚀 Ракета взлетает!\n"
-                f"Ставка: {amount} {mimriks(amount)}\n"
-                f"Множитель: {crash_point:.2f}x\n\n"
-                "💥 Ракета взорвалась! Ставка проиграна."
-            )
-            try:
-                await bot.edit_message_text(
-                    chat_id=chat_id,
-                    message_id=state["message_id"],
-                    text=text,
-                    reply_markup=None,
-                )
-            except Exception:
-                pass
-            rocket_games.pop(key, None)
-            return
-
-        text = (
-            "🚀 Ракета взлетает!\n"
-            f"Ставка: {amount} {mimriks(amount)}\n"
-            f"Множитель: {current_mult:.2f}x\n\n"
-            "Рост по фиксированной кривой; момент краша заранее не угадывается.\n\n"
-            "Нажмите «Забрать», чтобы забрать выигрыш."
-        )
-        try:
-            kb = InlineKeyboardBuilder()
-            kb.add(InlineKeyboardButton(text="Забрать", callback_data="rocket_stop"))
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=state["message_id"],
-                text=text,
-                reply_markup=kb.as_markup(),
-            )
-        except Exception:
-            state["active"] = False
-            state["finalized"] = True
-            rocket_games.pop(key, None)
-            return
-
-
-@dp.callback_query(F.data == "rocket_stop")
-async def rocket_stop_callback(callback: CallbackQuery):
-    chat_id = callback.message.chat.id
-    user_id = callback.from_user.id
-    key = (chat_id, user_id)
-
-    state = rocket_games.get(key)
-    if not state or not state.get("active"):
-        await callback.answer("Игра уже завершена.", show_alert=True)
-        return
-
-    # Снимок множителя до инвалидации полёта (чтобы не промахнуться с тиком фона)
-    amount = state["amount"]
-    multiplier = state["multiplier"]
-    # Инвалидируем цикл _rocket_flight — после этого он не редактирует сообщение
-    state["flight_epoch"] = state.get("flight_epoch", 0) + 1
-    state["active"] = False
-    state["finalized"] = True
-
-    win = int(amount * multiplier)
-
-    await db.change_balance(user_id, chat_id, win)
-
-    text = (
-        "🚀 Ракета взлетает!\n"
-        f"Ставка: {amount} {mimriks(amount)}\n"
-        f"Множитель: {multiplier:.2f}x\n\n"
-        f"🛑 Вы нажали «Забрать» и выиграли {win} {mimriks(win)}!"
-    )
-
-    try:
-        await callback.message.edit_text(text, reply_markup=None)
-    except Exception:
-        pass
-
-    rocket_games.pop(key, None)
-    await callback.answer(f"Вы забрали {win} {mimriks(win)}!")
-
 def _extract_utf16(text: str, offset: int, length: int) -> str:
     """Извлекает подстроку по offset и length в единицах UTF-16 (как в Telegram API)."""
     if not text or length <= 0:
@@ -1292,6 +1453,7 @@ async def rob(message: types.Message):
         return
 
     await db.set_rob_used(user_id, chat_id)
+    await db.stats_record_rob_attempt(user_id, chat_id)
 
     rob_success = get("rob_success_chance", 0.1)
     steal_pct = get("rob_steal_percent", 0.2)
@@ -1304,6 +1466,7 @@ async def rob(message: types.Message):
             # Штраф списывается с грабителя и начисляется жертве
             await db.change_balance(user_id, chat_id, -fine_amount)
             await db.change_balance(target_id, chat_id, fine_amount)
+            await db.stats_record_rob_fine(user_id, chat_id, fine_amount)
             w = mimriks(fine_amount)
             await message.reply(
                 f"🚔 Вас поймали! Вы потеряли {fine_amount} {w} (штраф за попытку кражи, начислен жертве)."
@@ -1315,6 +1478,13 @@ async def rob(message: types.Message):
     steal_amount = max(1, int(target_bal * steal_pct))
     await db.change_balance(target_id, chat_id, -steal_amount)
     await db.change_balance(user_id, chat_id, steal_amount)
+    await db.stats_record_rob_success_robber(user_id, chat_id, steal_amount)
+    await db.stats_record_rob_victim(target_id, chat_id, steal_amount)
+    r = await db.daily_quest_bump_rob_success(
+        user_id, chat_id, DAILY_QUEST_REWARD, DAILY_ROB_SUCCESS
+    )
+    if r:
+        await db.change_balance(user_id, chat_id, r)
 
     w = mimriks(steal_amount)
     await message.reply(f"💰 Кража удалась! Вы украли {steal_amount} {w}!")
@@ -1536,6 +1706,12 @@ async def _do_spin(chat_id: int, msg_to_edit: types.Message):
     winner_id, winner_name = winner
 
     await db.change_balance(winner_id, chat_id, total_bank)
+    for b in bets:
+        uid, _name, bet_amt = b[0], b[1], b[2]
+        if uid == winner_id:
+            await db.stats_record_game(uid, chat_id, "round", net_won=total_bank - bet_amt, net_lost=0)
+        else:
+            await db.stats_record_game(uid, chat_id, "round", net_won=0, net_lost=bet_amt)
     await db.clear_bets(chat_id)
     await db.clear_round_message(chat_id)
 
@@ -1601,6 +1777,12 @@ async def spin(message: types.Message):
     winner_id, winner_name = winner
 
     await db.change_balance(winner_id, chat_id, total_bank)
+    for b in bets:
+        uid, _name, bet_amt = b[0], b[1], b[2]
+        if uid == winner_id:
+            await db.stats_record_game(uid, chat_id, "round", net_won=total_bank - bet_amt, net_lost=0)
+        else:
+            await db.stats_record_game(uid, chat_id, "round", net_won=0, net_lost=bet_amt)
     await db.clear_bets(chat_id)
     await db.clear_round_message(chat_id)
 
@@ -1666,6 +1848,7 @@ async def chest_grab(message: types.Message):
 
     reward = _roll_chest_reward()
     await db.change_balance(user_id, chat_id, reward)
+    await db.stats_record_chest(user_id, chat_id, reward)
 
     del chest_available[chat_id]
     # Планируем следующий сундук через 1–20 минут
@@ -1693,6 +1876,7 @@ async def chest_callback(callback: CallbackQuery):
 
     reward = _roll_chest_reward()
     await db.change_balance(user_id, chat_id, reward)
+    await db.stats_record_chest(user_id, chat_id, reward)
 
     del chest_available[chat_id]
     min_i = get("chest_min_interval", 60)
@@ -1776,18 +1960,21 @@ BOT_COMMANDS = [
     BotCommand(command="bank", description="Текущий банк раунда"),
     BotCommand(command="transfer", description="Перевести мимрики"),
     BotCommand(command="coinflip", description="50/50: удвоить или проиграть"),
-    BotCommand(command="mines", description="Сапёр: множители и бомбы"),
-    BotCommand(command="rocket", description="Ракета: множитель до краша"),
+    BotCommand(command="slot", description="Слот (куб 🎰)"),
+    BotCommand(command="mines", description="Сапёр 5×5, множители до ×100"),
     BotCommand(command="roulette", description="Рулетка: цвета и числа"),
     BotCommand(command="rob", description="Попытаться украсть мимрики"),
     BotCommand(command="chest", description="Забрать сундук"),
+    BotCommand(command="stats", description="Статистика"),
+    BotCommand(command="daily", description="Ежедневные задания"),
     BotCommand(command="leaderboard", description="Топ игроков"),
-    BotCommand(command="spin", description="(админ) Запустить рулетку"),
+    BotCommand(command="spin", description="(админ) Запустить колесо"),
 ]
 
 
 async def main():
     await db.init_db()
+    await bot.delete_webhook(drop_pending_updates=True)
     await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
     await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
     asyncio.create_task(chest_spawn_task())
