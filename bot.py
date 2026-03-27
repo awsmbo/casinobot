@@ -94,15 +94,6 @@ def _slot_payout_telegram(value: int) -> tuple[float, str]:
     return 0.0, "Проигрыш"
 
 
-def _slot_combo_display(value: int) -> str:
-    """Строка с тремя символами барабанов (как в клиенте Telegram)."""
-    if value == 64:
-        return "7️⃣7️⃣7️⃣"
-    L, C, R = _slot_decode_reels(value)
-    em = ("🍒", "🍇", "🍋", "💎")
-    return f"{em[L]}{em[C]}{em[R]}"
-
-
 @dp.my_chat_member()
 async def on_bot_chat_member(event: ChatMemberUpdated):
     """Запоминаем пользователя, который добавил бота в группу / вернул бота в чат."""
@@ -542,12 +533,10 @@ async def slot_cmd(message: types.Message):
     val = dice_msg.dice.value if dice_msg.dice else 0
     mult, label = _slot_payout_telegram(val)
 
-    combo = _slot_combo_display(val)
     if mult <= 0:
         await db.stats_record_game(user_id, chat_id, "slot", net_won=0, net_lost=amount)
         bal2 = await db.get_balance(user_id, chat_id)
         await dice_msg.reply(
-            f"🎰 {combo}\n"
             f"{label} (куб: {val})\n"
             f"Ставка {amount} {mimriks(amount)} не окупилась.\n"
             f"Баланс: {bal2} {mimriks(bal2)}"
@@ -560,7 +549,6 @@ async def slot_cmd(message: types.Message):
     await db.stats_record_game(user_id, chat_id, "slot", net_won=max(0, profit), net_lost=0)
     bal2 = await db.get_balance(user_id, chat_id)
     await dice_msg.reply(
-        f"🎰 {combo}\n"
         f"{label} (куб: {val})\n"
         f"Выплата: {gross} {mimriks(gross)} (чистыми +{profit}).\n"
         f"Баланс: {bal2} {mimriks(bal2)}"
