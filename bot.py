@@ -49,6 +49,7 @@ DAILY_COINFLIP_PLAYS = 50
 DAILY_ROB_SUCCESS = 1
 DAILY_ROULETTE_WINS = 10
 DAILY_MINES_PLAYS = 10
+DAILY_SLOT_SPINS = 50
 
 
 def _mines_cumulative_multiplier(safe_opened: int) -> float:
@@ -533,10 +534,17 @@ async def slot_cmd(message: types.Message):
     val = dice_msg.dice.value if dice_msg.dice else 0
     mult, label = _slot_payout_telegram(val)
 
+    if amount >= DAILY_MIN_BET:
+        r = await db.daily_quest_bump_slot_play(
+            user_id, chat_id, DAILY_QUEST_REWARD, DAILY_SLOT_SPINS
+        )
+        if r:
+            await db.change_balance(user_id, chat_id, r)
+
     if mult <= 0:
         await db.stats_record_game(user_id, chat_id, "slot", net_won=0, net_lost=amount)
         bal2 = await db.get_balance(user_id, chat_id)
-        await dice_msg.reply(
+        await message.reply(
             f"{label} (куб: {val})\n"
             f"Ставка {amount} {mimriks(amount)} не окупилась.\n"
             f"Баланс: {bal2} {mimriks(bal2)}"
@@ -548,7 +556,7 @@ async def slot_cmd(message: types.Message):
     profit = gross - amount
     await db.stats_record_game(user_id, chat_id, "slot", net_won=max(0, profit), net_lost=0)
     bal2 = await db.get_balance(user_id, chat_id)
-    await dice_msg.reply(
+    await message.reply(
         f"{label} (куб: {val})\n"
         f"Выплата: {gross} {mimriks(gross)} (чистыми +{profit}).\n"
         f"Баланс: {bal2} {mimriks(bal2)}"
@@ -621,6 +629,7 @@ def _format_daily_quests_text(q: dict) -> str:
     rr = q.get("reward_rob")
     rrw = q.get("reward_roulette")
     rm = q.get("reward_mines")
+    rs = q.get("reward_slot")
 
     lines = [
         f"📅 Ежедневные задания ({q.get('day', '')})\n"
@@ -651,6 +660,13 @@ def _format_daily_quests_text(q: dict) -> str:
             q.get("mines_plays", 0),
             DAILY_MINES_PLAYS,
             f"Сыграть в /mines {DAILY_MINES_PLAYS} раз",
+            f"награда {DAILY_QUEST_REWARD}",
+        ),
+        row(
+            bool(rs),
+            q.get("slot_plays", 0),
+            DAILY_SLOT_SPINS,
+            f"Покрутить /slot {DAILY_SLOT_SPINS} раз",
             f"награда {DAILY_QUEST_REWARD}",
         ),
     ]

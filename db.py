@@ -150,13 +150,26 @@ async def init_db():
             rob_success INTEGER DEFAULT 0,
             roulette_wins INTEGER DEFAULT 0,
             mines_plays INTEGER DEFAULT 0,
+            slot_plays INTEGER DEFAULT 0,
             reward_coinflip INTEGER DEFAULT 0,
             reward_rob INTEGER DEFAULT 0,
             reward_roulette INTEGER DEFAULT 0,
             reward_mines INTEGER DEFAULT 0,
+            reward_slot INTEGER DEFAULT 0,
             PRIMARY KEY (user_id, chat_id, day)
         )
         """)
+
+        cursor = await db.execute("PRAGMA table_info(daily_quest_state)")
+        dq_cols = [r[1] for r in await cursor.fetchall()]
+        if dq_cols and "slot_plays" not in dq_cols:
+            await db.execute(
+                "ALTER TABLE daily_quest_state ADD COLUMN slot_plays INTEGER DEFAULT 0"
+            )
+        if dq_cols and "reward_slot" not in dq_cols:
+            await db.execute(
+                "ALTER TABLE daily_quest_state ADD COLUMN reward_slot INTEGER DEFAULT 0"
+            )
 
         if needs_migration:
             for uid, username, balance in old_users:
@@ -619,8 +632,8 @@ async def _get_daily_row(user_id: int, chat_id: int, day: str):
     async with aiosqlite.connect(DB_NAME) as db:
         cursor = await db.execute(
             """
-            SELECT coinflip_count, rob_success, roulette_wins, mines_plays,
-                   reward_coinflip, reward_rob, reward_roulette, reward_mines
+            SELECT coinflip_count, rob_success, roulette_wins, mines_plays, slot_plays,
+                   reward_coinflip, reward_rob, reward_roulette, reward_mines, reward_slot
             FROM daily_quest_state
             WHERE user_id = ? AND chat_id = ? AND day = ?
             """,
@@ -635,9 +648,9 @@ async def _ensure_daily_row(user_id: int, chat_id: int, day: str):
             """
             INSERT OR IGNORE INTO daily_quest_state(
                 user_id, chat_id, day,
-                coinflip_count, rob_success, roulette_wins, mines_plays,
-                reward_coinflip, reward_rob, reward_roulette, reward_mines
-            ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0)
+                coinflip_count, rob_success, roulette_wins, mines_plays, slot_plays,
+                reward_coinflip, reward_rob, reward_roulette, reward_mines, reward_slot
+            ) VALUES (?, ?, ?, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
             """,
             (user_id, chat_id, day),
         )
@@ -657,7 +670,7 @@ async def daily_quest_bump_coinflip(user_id: int, chat_id: int, reward_amount: i
     row = await _get_daily_row(user_id, chat_id, day)
     if not row:
         return 0
-    cnt, _, _, _, r_cf, _, _, _ = row
+    cnt, _, _, _, _, r_cf, _, _, _, _ = row
     if r_cf or cnt < target:
         return 0
     async with aiosqlite.connect(DB_NAME) as db:
@@ -681,7 +694,7 @@ async def daily_quest_bump_rob_success(user_id: int, chat_id: int, reward_amount
     row = await _get_daily_row(user_id, chat_id, day)
     if not row:
         return 0
-    _, rob_ok, _, _, _, r_rob, _, _ = row
+    _, rob_ok, _, _, _, _, r_rob, _, _, _ = row
     if r_rob or rob_ok < target:
         return 0
     async with aiosqlite.connect(DB_NAME) as db:
@@ -705,7 +718,7 @@ async def daily_quest_bump_roulette_win(user_id: int, chat_id: int, reward_amoun
     row = await _get_daily_row(user_id, chat_id, day)
     if not row:
         return 0
-    _, _, rw, _, _, _, r_r, _ = row
+    _, _, rw, _, _, _, _, r_r, _, _ = row
     if r_r or rw < target:
         return 0
     async with aiosqlite.connect(DB_NAME) as db:
@@ -730,12 +743,38 @@ async def daily_quest_bump_mines_play(user_id: int, chat_id: int, reward_amount:
     if not row:
         return 0
     mines_cnt = row[3]
-    r_m = row[7]
+    r_m = row[8]
     if r_m or mines_cnt < target:
         return 0
     async with aiosqlite.connect(DB_NAME) as db:
         await db.execute(
             "UPDATE daily_quest_state SET reward_mines = 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+    return reward_amount
+
+
+async def daily_quest_bump_slot_play(user_id: int, chat_id: int, reward_amount: int, target: int) -> int:
+    """+1 к счётчику /slot (ставка уже проверена ≥ порога)."""
+    day = today_str()
+    await _ensure_daily_row(user_id, chat_id, day)
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE daily_quest_state SET slot_plays = slot_plays + 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
+            (user_id, chat_id, day),
+        )
+        await db.commit()
+    row = await _get_daily_row(user_id, chat_id, day)
+    if not row:
+        return 0
+    slot_cnt = row[4]
+    r_slot = row[9]
+    if r_slot or slot_cnt < target:
+        return 0
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            "UPDATE daily_quest_state SET reward_slot = 1 WHERE user_id = ? AND chat_id = ? AND day = ?",
             (user_id, chat_id, day),
         )
         await db.commit()
@@ -753,20 +792,24 @@ async def get_daily_quest_snapshot(user_id: int, chat_id: int) -> dict[str, Any]
             "rob_success": 0,
             "roulette_wins": 0,
             "mines_plays": 0,
+            "slot_plays": 0,
             "reward_coinflip": 0,
             "reward_rob": 0,
             "reward_roulette": 0,
             "reward_mines": 0,
+            "reward_slot": 0,
         }
     (
         coinflip_count,
         rob_success,
         roulette_wins,
         mines_plays,
+        slot_plays,
         reward_coinflip,
         reward_rob,
         reward_roulette,
         reward_mines,
+        reward_slot,
     ) = row
     return {
         "day": day,
@@ -774,8 +817,10 @@ async def get_daily_quest_snapshot(user_id: int, chat_id: int) -> dict[str, Any]
         "rob_success": rob_success,
         "roulette_wins": roulette_wins,
         "mines_plays": mines_plays,
+        "slot_plays": slot_plays,
         "reward_coinflip": reward_coinflip,
         "reward_rob": reward_rob,
         "reward_roulette": reward_roulette,
         "reward_mines": reward_mines,
+        "reward_slot": reward_slot,
     }
