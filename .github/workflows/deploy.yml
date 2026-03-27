@@ -1,0 +1,33 @@
+name: Deploy Bot
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Connect and deploy
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SERVER_IP }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /root/your-bot-folder
+            git pull origin main
+
+            # ВЫБЕРИ ОДИН ВАРИАНТ ↓↓↓
+
+            # если docker:
+            docker compose down
+            docker compose up -d
+
+            # если systemd:
+            # systemctl restart bot
+
+            # если pm2:
+            # pm2 restart bot
