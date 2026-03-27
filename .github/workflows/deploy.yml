@@ -17,17 +17,7 @@ jobs:
           username: ${{ secrets.SERVER_USER }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd /root/your-bot-folder
+            cd /root/casinobot
             git pull origin main
 
-            # ВЫБЕРИ ОДИН ВАРИАНТ ↓↓↓
-
-            # если docker:
-            docker compose down
-            docker compose up -d
-
-            # если systemd:
-            # systemctl restart bot
-
-            # если pm2:
-            # pm2 restart bot
+            systemctl restart casino-bot
