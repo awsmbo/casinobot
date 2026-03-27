@@ -1,7 +1,5 @@
 import asyncio
-import hashlib
 import random
-import secrets
 import time
 
 from aiogram import Bot, Dispatcher, types, F
@@ -36,12 +34,14 @@ mines_games = {}
 
 MINES_GRID_SIDE = 5
 MINES_GRID = MINES_GRID_SIDE * MINES_GRID_SIDE  # 25
-MINES_MIN_COUNT = 1
-MINES_MAX_COUNT = 24
-# 8 множителей: m1=1.2, m2..m8 одинаковые, произведение = 100
+MINES_SAFE_TOTAL = 10
+MINES_MINE_COUNT = 15  # 10 + 15 = 25
+# 10 множителей: m1=1.2, m2..m10 одинаковые, произведение = 100
 MINES_MULT_FIRST = 1.2
-MINES_MULT_STEP = (100.0 / MINES_MULT_FIRST) ** (1.0 / 7.0)
-MINES_MULTIPLIERS = [MINES_MULT_FIRST] + [MINES_MULT_STEP] * 7
+MINES_MULT_STEP = (100.0 / MINES_MULT_FIRST) ** (1.0 / 9.0)
+MINES_MULTIPLIERS = [MINES_MULT_FIRST] + [MINES_MULT_STEP] * 9
+
+SLOT_ANIMATION_SECONDS = 3.5
 
 DAILY_MIN_BET = 1000
 DAILY_QUEST_REWARD = 10_000
@@ -54,25 +54,53 @@ DAILY_MINES_PLAYS = 10
 def _mines_cumulative_multiplier(safe_opened: int) -> float:
     if safe_opened <= 0:
         return 0.0
-    n = min(safe_opened, 8)
+    n = min(safe_opened, MINES_SAFE_TOTAL)
+    if n == MINES_SAFE_TOTAL:
+        return 100.0
     p = 1.0
     for i in range(n):
         p *= MINES_MULTIPLIERS[i]
     return p
 
 
-def _slot_multiplier_and_label(value: int) -> tuple[float, str]:
+def _slot_decode_reels(value: int) -> tuple[int, int, int]:
+    """Символы 0–3 на барабанах (https://core.telegram.org/api/dice — слот)."""
+    if value == 64:
+        return (3, 3, 3)
+    v = value - 1
+    left = v & 3
+    center = (v >> 2) & 3
+    right = (v >> 4) & 3
+    return (left, center, right)
+
+
+def _slot_payout_telegram(value: int) -> tuple[float, str]:
+    """Выплата по комбинации, как в Telegram (не по «сырым» диапазонам 1–32)."""
+    if value < 1 or value > 64:
+        return 0.0, "Проигрыш"
     if value == 64:
         return 50.0, "Джекпот ×50"
-    if 61 <= value <= 63:
-        return 10.0, "×10"
-    if 55 <= value <= 60:
-        return 5.0, "×5"
-    if 52 <= value <= 54:
-        return 3.0, "×3"
-    if 33 <= value <= 51:
-        return 1.2, "×1.2"
+    L, C, R = _slot_decode_reels(value)
+    if L == C == R:
+        if L == 0:
+            return 3.0, "Три в ряд (×3)"
+        if L == 1:
+            return 5.0, "Три в ряд (×5)"
+        if L == 2:
+            return 10.0, "Три в ряд (×10)"
+        return 0.0, "Проигрыш"
+    if L == C or C == R or L == R:
+        return 1.2, "Две одинаковых (×1.2)"
     return 0.0, "Проигрыш"
+
+
+def _slot_combo_display(value: int) -> str:
+    """Строка с тремя символами барабанов (как в клиенте Telegram)."""
+    if value == 64:
+        return "7️⃣7️⃣7️⃣"
+    L, C, R = _slot_decode_reels(value)
+    em = ("🍒", "🍇", "🍋", "💎")
+    return f"{em[L]}{em[C]}{em[R]}"
 
 
 @dp.my_chat_member()
@@ -217,7 +245,7 @@ async def help_cmd(message: types.Message):
         "/bank — текущий банк раунда\n"
         "/transfer @user <сумма> — передать мимрики другому игроку\n"
         "/coinflip <сумма> — 50/50: проиграть или удвоить\n"
-        "/mines <ставка> — сапёр 5×5: 8 множителей (макс. ×100)\n"
+        "/mines <ставка> — сапёр 5×5: 10 безопасных клеток, до ×100\n"
         "/slot <ставка> — слот (куб 🎰)\n"
         "/rob @user — попытаться украсть мимрики (10% шанс, 1 раз в 30 мин)\n"
         "/stats — ваша статистика\n"
@@ -510,15 +538,18 @@ async def slot_cmd(message: types.Message):
 
     await db.change_balance(user_id, chat_id, -amount)
     dice_msg = await message.answer_dice(emoji="🎰")
+    await asyncio.sleep(SLOT_ANIMATION_SECONDS)
     val = dice_msg.dice.value if dice_msg.dice else 0
-    mult, label = _slot_multiplier_and_label(val)
+    mult, label = _slot_payout_telegram(val)
 
+    combo = _slot_combo_display(val)
     if mult <= 0:
         await db.stats_record_game(user_id, chat_id, "slot", net_won=0, net_lost=amount)
         bal2 = await db.get_balance(user_id, chat_id)
-        await message.reply(
-            f"🎰 Выпало значение {val}. {label}.\n"
-            f"Ставка {amount} {mimriks(amount)} проиграна.\n"
+        await dice_msg.reply(
+            f"🎰 {combo}\n"
+            f"{label} (куб: {val})\n"
+            f"Ставка {amount} {mimriks(amount)} не окупилась.\n"
             f"Баланс: {bal2} {mimriks(bal2)}"
         )
         return
@@ -528,8 +559,9 @@ async def slot_cmd(message: types.Message):
     profit = gross - amount
     await db.stats_record_game(user_id, chat_id, "slot", net_won=max(0, profit), net_lost=0)
     bal2 = await db.get_balance(user_id, chat_id)
-    await message.reply(
-        f"🎰 Выпало {val}. {label}\n"
+    await dice_msg.reply(
+        f"🎰 {combo}\n"
+        f"{label} (куб: {val})\n"
         f"Выплата: {gross} {mimriks(gross)} (чистыми +{profit}).\n"
         f"Баланс: {bal2} {mimriks(bal2)}"
     )
@@ -650,116 +682,61 @@ async def daily_cmd(message: types.Message):
     await message.reply(_format_daily_quests_text(q))
 
 
-def _mines_layout_from_seed(server_seed: str, game_salt: str, n_mines: int) -> set[int]:
-    digest = hashlib.sha256(f"{server_seed}|{game_salt}|{n_mines}".encode()).hexdigest()
-    rng = random.Random(int(digest[:16], 16))
-    positions = list(range(MINES_GRID))
-    rng.shuffle(positions)
-    return set(positions[:n_mines])
-
-
-def _mines_pick_text(amount: int) -> str:
-    m1 = MINES_MULT_FIRST
-    mrest = MINES_MULT_STEP
-    return (
-        "💣 Сапёр 5×5\n\n"
-        f"Ставка: {amount} {mimriks(amount)}\n"
-        f"8 множителей: ×{m1:g} и далее ×{mrest:.4f} (×7), итоговый макс. ×100.\n\n"
-        "Выберите число мин на поле (1–24). "
-        "Больше мин — выше риск.\n\n"
-        "После выбора спишется ставка и сгенерируется поле. "
-        "Честность: после игры будет показан seed для проверки SHA256."
-    )
-
-
-def _mines_pick_keyboard() -> InlineKeyboardMarkup:
-    builder = InlineKeyboardBuilder()
-    for r in range(4):
-        row_btns = []
-        for c in range(6):
-            n = r * 6 + c + 1
-            if n > MINES_MAX_COUNT:
-                break
-            row_btns.append(InlineKeyboardButton(text=str(n), callback_data=f"ms_p_{n}"))
-        if row_btns:
-            builder.row(*row_btns)
-    return builder.as_markup()
-
-
-def _mines_field_lines(state: dict, *, reveal_all: bool) -> str:
-    mine_cells = state.get("mine_cells") or set()
-    revealed = state.get("revealed") or set()
-    rows = []
-    for r in range(MINES_GRID_SIDE):
-        cells = []
-        for c in range(MINES_GRID_SIDE):
-            i = r * MINES_GRID_SIDE + c
-            if not reveal_all and i not in revealed:
-                cells.append("▢")
-            elif i in mine_cells:
-                cells.append("💣")
-            else:
-                cells.append("·")
-        rows.append(" ".join(cells))
-    return "\n".join(rows)
+def _mines_safe_cell_multiplier_label(state: dict, idx: int) -> str:
+    """Текущий накопленный множитель на открытой безопасной клетке (по порядку открытия)."""
+    order = state.get("safe_order") or []
+    if idx not in order:
+        return "✓"
+    k = order.index(idx) + 1
+    if k >= MINES_SAFE_TOTAL:
+        return "×100"
+    m = _mines_cumulative_multiplier(k)
+    if m >= 100:
+        return "×100"
+    if m >= 10:
+        return f"×{m:.1f}".rstrip("0").rstrip(".")
+    return f"×{m:.2f}"
 
 
 def _mines_game_text(state: dict, *, over: bool = False, win: bool = False) -> str:
     amount = state["amount"]
     safe_opened = state["safe_opened"]
     total_safe = state["total_safe"]
-    n_mines = state["mines_count"]
+    n_mines = MINES_MINE_COUNT
     mult = _mines_cumulative_multiplier(safe_opened)
     win_amt = int(amount * mult) if safe_opened > 0 else 0
-    seed_hash = state.get("server_seed_hash", "")
-
-    verify_tail = ""
-    if over and state.get("server_seed"):
-        verify_tail = (
-            f"\n\n🔐 Provably fair\n"
-            f"seed: <code>{state['server_seed']}</code>\n"
-            f"SHA256: <code>{hashlib.sha256(state['server_seed'].encode()).hexdigest()}</code>"
-        )
-
-    field_block = ""
-    if over and state.get("phase") == "play":
-        field_block = "\n\nПоле:\n" + _mines_field_lines(state, reveal_all=True)
 
     if over and not win:
         return (
             "💥 Мина! Ставка проиграна.\n\n"
             f"Ставка: {amount} {mimriks(amount)}\n"
-            f"Мин на поле: {n_mines}\n"
+            f"Мин на поле: {n_mines} · Безопасных клеток: {total_safe}\n"
             f"Открыто безопасных до взрыва: {safe_opened}/{total_safe}\n"
-            f"Множитель был: ×{mult:.2f}"
-            + field_block
-            + verify_tail
+            f"Множитель на момент взрыва: ×{mult:.2f}"
         )
 
     if over and win:
         return (
-            "🎉 Вы забрали выигрыш!\n\n"
+            "🎉 Игра завершена.\n\n"
             f"Выплата: {win_amt} {mimriks(win_amt)}\n"
-            f"Множитель: ×{mult:.2f} ({safe_opened}/{total_safe} безопасных)\n"
-            f"Мин: {n_mines}"
-            + field_block
-            + verify_tail
+            f"Итоговый множитель: ×{mult:.2f} ({safe_opened}/{total_safe} безопасных)\n"
+            f"Мин на поле: {n_mines}"
         )
 
     lines = [
         "💣 Сапёр 5×5",
         "",
         f"Ставка: {amount} {mimriks(amount)} · Мин: {n_mines} · Безопасных: {total_safe}",
-        f"SHA256(seed) до раскрытия: <code>{seed_hash}</code>",
+        f"10 шагов множителя (макс. ×100): ×{MINES_MULT_FIRST:g} и далее ×{MINES_MULT_STEP:.4f} (×9).",
         "",
         f"Открыто безопасных: {safe_opened}/{total_safe}",
-        f"Шаг множителя: {min(safe_opened, 8)}/8 (макс. ×100)",
+        f"Шаг множителя: {min(safe_opened, MINES_SAFE_TOTAL)}/{MINES_SAFE_TOTAL}",
     ]
     if safe_opened > 0:
-        lines.append(f"Множитель: ×{mult:.2f}")
+        lines.append(f"Текущий множитель: ×{mult:.2f}")
         lines.append(f"Забрать сейчас: {win_amt} {mimriks(win_amt)}")
     else:
-        lines.append("Множитель появится после первой безопасной клетки.")
+        lines.append("На безопасной клетке будет показан текущий множитель.")
     lines.append("")
     lines.append("Открывайте по одной клетке или нажмите «Забрать».")
     return "\n".join(lines)
@@ -769,23 +746,31 @@ def _mines_build_keyboard(state: dict) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     mine_cells = state["mine_cells"]
     revealed = state["revealed"]
-    active = state["active"]
+    game_over = state.get("finished", False)
+    playable = state.get("active", False) and not game_over
 
     for row in range(MINES_GRID_SIDE):
         row_btns = []
         for col in range(MINES_GRID_SIDE):
             idx = row * MINES_GRID_SIDE + col
-            if idx in revealed:
-                if idx in mine_cells:
-                    label = "💥"
+            if idx in mine_cells:
+                if idx in revealed or game_over:
+                    row_btns.append(InlineKeyboardButton(text="💣", callback_data="ms_n"))
                 else:
-                    label = "✓"
-                row_btns.append(InlineKeyboardButton(text=label, callback_data="ms_n"))
+                    row_btns.append(
+                        InlineKeyboardButton(text="▢", callback_data=f"ms_o_{idx}" if playable else "ms_n")
+                    )
             else:
-                row_btns.append(InlineKeyboardButton(text="▢", callback_data=f"ms_o_{idx}"))
+                if idx in revealed:
+                    lab = _mines_safe_cell_multiplier_label(state, idx)
+                    row_btns.append(InlineKeyboardButton(text=lab, callback_data="ms_n"))
+                elif game_over:
+                    row_btns.append(InlineKeyboardButton(text="✓", callback_data="ms_n"))
+                else:
+                    row_btns.append(InlineKeyboardButton(text="▢", callback_data=f"ms_o_{idx}"))
         builder.row(*row_btns)
 
-    if active and state["safe_opened"] >= 1:
+    if playable and state["safe_opened"] >= 1:
         builder.row(InlineKeyboardButton(text="💰 Забрать", callback_data="ms_c"))
 
     return builder.as_markup()
@@ -822,15 +807,16 @@ async def _mines_finish(
     win: bool,
 ):
     state["active"] = False
-    mines_games.pop(key, None)
+    state["finished"] = True
+    kb = _mines_build_keyboard(state)
     text = _mines_game_text(state, over=True, win=win)
+    mines_games.pop(key, None)
     try:
         await bot.edit_message_text(
             chat_id=chat_id,
             message_id=message_id,
             text=text,
-            reply_markup=None,
-            parse_mode="HTML",
+            reply_markup=kb,
         )
     except Exception:
         pass
@@ -838,7 +824,7 @@ async def _mines_finish(
 
 @dp.message(Command("mines"))
 async def mines_cmd(message: types.Message):
-    """Сапёр 5×5: /mines <ставка>, затем выбор числа мин."""
+    """Сапёр 5×5: 10 безопасных клеток, 15 мин, множители до ×100."""
     if not await _thread_allowed(message):
         await message.reply("Используйте /mines в нужной теме чата (если в группе есть темы).")
         return
@@ -860,7 +846,7 @@ async def mines_cmd(message: types.Message):
     key = (chat_id, user_id)
 
     existing = mines_games.get(key)
-    if existing and existing.get("active") and existing.get("phase") == "play":
+    if existing and existing.get("active"):
         await message.reply("У вас уже идёт партия сапёра. Сначала закончите её.")
         return
 
@@ -875,14 +861,23 @@ async def mines_cmd(message: types.Message):
     if existing:
         mines_games.pop(key, None)
 
+    await db.change_balance(user_id, chat_id, -amount)
+
+    mine_cells = set(random.sample(range(MINES_GRID), MINES_MINE_COUNT))
     state = {
-        "phase": "pick_mines",
+        "phase": "play",
         "amount": amount,
         "owner_id": user_id,
         "active": True,
+        "finished": False,
+        "mine_cells": mine_cells,
+        "total_safe": MINES_SAFE_TOTAL,
+        "revealed": set(),
+        "safe_order": [],
+        "safe_opened": 0,
         "message_id": 0,
     }
-    msg = await message.reply(_mines_pick_text(amount), reply_markup=_mines_pick_keyboard())
+    msg = await message.reply(_mines_game_text(state), reply_markup=_mines_build_keyboard(state))
     state["message_id"] = msg.message_id
     mines_games[key] = state
 
@@ -919,63 +914,6 @@ async def mines_callback(callback: CallbackQuery):
         await callback.answer()
         return
 
-    # --- выбор числа мин ---
-    if state.get("phase") == "pick_mines":
-        if not data.startswith("ms_p_"):
-            await callback.answer("Сначала выберите число мин кнопками ниже.", show_alert=True)
-            return
-        try:
-            n_mines = int(data[5:])
-        except ValueError:
-            await callback.answer()
-            return
-        if n_mines < MINES_MIN_COUNT or n_mines > MINES_MAX_COUNT:
-            await callback.answer("Неверное число мин.", show_alert=True)
-            return
-
-        amount = state["amount"]
-        bal = await db.get_balance(user_id, chat_id)
-        if bal is None or amount > bal:
-            mines_games.pop(key, None)
-            await callback.answer("Недостаточно средств для ставки.", show_alert=True)
-            try:
-                await callback.message.edit_text("Игра отменена: недостаточно мимриков.", reply_markup=None)
-            except Exception:
-                pass
-            return
-
-        await db.change_balance(user_id, chat_id, -amount)
-
-        server_seed = secrets.token_hex(16)
-        server_seed_hash = hashlib.sha256(server_seed.encode()).hexdigest()
-        game_salt = f"{chat_id}:{user_id}:{mid}:{n_mines}"
-        mine_cells = _mines_layout_from_seed(server_seed, game_salt, n_mines)
-        total_safe = MINES_GRID - n_mines
-
-        state.update(
-            {
-                "phase": "play",
-                "mines_count": n_mines,
-                "mine_cells": mine_cells,
-                "total_safe": total_safe,
-                "revealed": set(),
-                "safe_opened": 0,
-                "server_seed": server_seed,
-                "server_seed_hash": server_seed_hash,
-                "game_salt": game_salt,
-            }
-        )
-
-        text = _mines_game_text(state)
-        kb = _mines_build_keyboard(state)
-        try:
-            await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
-        except Exception:
-            pass
-        await callback.answer(f"Мин: {n_mines}. Удачи!")
-        return
-
-    # --- игра ---
     if state.get("phase") != "play":
         await callback.answer("Игра не активна.", show_alert=True)
         return
@@ -1015,6 +953,7 @@ async def mines_callback(callback: CallbackQuery):
         await callback.answer("💥 Мина!", show_alert=True)
         return
 
+    state["safe_order"].append(idx)
     state["safe_opened"] += 1
     total_safe = state["total_safe"]
 
@@ -1030,7 +969,7 @@ async def mines_callback(callback: CallbackQuery):
     text = _mines_game_text(state)
     kb = _mines_build_keyboard(state)
     try:
-        await callback.message.edit_text(text=text, reply_markup=kb, parse_mode="HTML")
+        await callback.message.edit_text(text=text, reply_markup=kb)
     except Exception:
         pass
     mult = _mines_cumulative_multiplier(state["safe_opened"])
