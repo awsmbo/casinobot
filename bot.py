@@ -1,9 +1,11 @@
 import asyncio
+import calendar
 import random
 import re
 import time
 import unicodedata
 from collections import Counter
+from typing import Optional
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import BaseFilter, Command
@@ -71,6 +73,11 @@ GOLDEN_HOUR_FIRST_DELAY_MAX = int(4 * 3600)
 PASSWORD_ATTEMPTS = 5
 PASSWORD_WIN_MULT = 10
 
+BIRTHDAY_GIFT_AMOUNT = 100_000
+_BIRTHDAY_CACHE_TTL_OK = 86400
+_BIRTHDAY_CACHE_TTL_MISS = 3600
+_birth_month_day_cache: dict[int, tuple[Optional[tuple[int, int]], float]] = {}
+
 
 def _golden_hour_active() -> bool:
     until = get("golden_hour_until", 0)
@@ -84,6 +91,60 @@ def _apply_golden_hour_to_payout(payout: int) -> tuple[int, str]:
     if payout <= 0 or not _golden_hour_active():
         return payout, ""
     return payout * 2, "\n🌟 Золотой час: выигрыш ×2!"
+
+
+def _birthday_matches_calendar(month: int, day: int, today) -> bool:
+    if month == today.month and day == today.day:
+        return True
+    if (
+        month == 2
+        and day == 29
+        and today.month == 2
+        and today.day == 28
+        and not calendar.isleap(today.year)
+    ):
+        return True
+    return False
+
+
+async def _telegram_birth_month_day(user_id: int) -> Optional[tuple[int, int]]:
+    """Месяц и день из профиля TG (getChat), если пользователь открыл боту доступ к дате."""
+    now = time.time()
+    cached = _birth_month_day_cache.get(user_id)
+    if cached is not None:
+        val, ts = cached
+        ttl = _BIRTHDAY_CACHE_TTL_OK if val is not None else _BIRTHDAY_CACHE_TTL_MISS
+        if now - ts < ttl:
+            return val
+    try:
+        chat = await bot.get_chat(user_id)
+    except Exception:
+        _birth_month_day_cache[user_id] = (None, now)
+        return None
+    bd = getattr(chat, "birthdate", None)
+    if bd is None:
+        _birth_month_day_cache[user_id] = (None, now)
+        return None
+    mmdd = (bd.month, bd.day)
+    _birth_month_day_cache[user_id] = (mmdd, now)
+    return mmdd
+
+
+async def _maybe_birthday_gift(user_id: int, chat_id: int) -> str:
+    """Один раз в год (календарь UTC+3), в день рождения из профиля Telegram."""
+    if await db.get_balance(user_id, chat_id) is None:
+        return ""
+    mmdd = await _telegram_birth_month_day(user_id)
+    if mmdd is None:
+        return ""
+    today = db.today_date_quest_tz()
+    if not _birthday_matches_calendar(mmdd[0], mmdd[1], today):
+        return ""
+    if not await db.birthday_try_claim_year(user_id, chat_id, today.year):
+        return ""
+    await db.change_balance(user_id, chat_id, BIRTHDAY_GIFT_AMOUNT)
+    w = mimriks(BIRTHDAY_GIFT_AMOUNT)
+    return f"\n\n🎂 С днём рождения! Подарок от казино: +{BIRTHDAY_GIFT_AMOUNT} {w}."
 
 
 def _password_feedback_states(secret: str, guess: str) -> list[str]:
@@ -288,7 +349,8 @@ def _private_instructions() -> str:
         "5. Победитель определяется случайно (чем больше ставка — тем выше шанс)\n\n"
         "Другие команды: /transfer, /coinflip, /slot, /dice, /mines, /password, /rob, /stats, /daily, /leaderboard\n"
         "Сундуки появляются случайно!\n"
-        "🌟 Золотой час (×2 к выигрышам в играх) включается сам несколько раз в сутки — смотрите /balance.\n\n"
+        "🌟 Золотой час (×2 к выигрышам в играх) включается сам несколько раз в сутки — смотрите /balance.\n"
+        "🎂 День рождения из профиля Telegram (если открыт боту): подарок в чате казино при /balance, /daily, /start — см. /help.\n\n"
         f"🔗 Исходный код: {GITHUB_URL}"
     )
 
@@ -298,16 +360,21 @@ def _private_instructions() -> str:
 async def start(message: types.Message):
     if not await _thread_allowed(message):
         return
+    uid = message.from_user.id
+    cid = message.chat.id
+    gift = await _maybe_birthday_gift(uid, cid)
     if message.chat.type == "private":
         await message.reply(
             "🎰 Добро пожаловать в казино!\n\n"
             + _private_instructions()
+            + gift
         )
     else:
         await message.reply(
             "🎰 Добро пожаловать в казино!\n\n"
             "Начните с /registration, чтобы получить 500 мимриков.\n"
             "Список команд: /help"
+            + gift
         )
 
 
@@ -334,7 +401,9 @@ async def help_cmd(message: types.Message):
         "/leaderboard — топ игроков\n"
         "Сундуки появляются случайно в чате!\n\n"
         "🌟 Золотой час (удвоение выигрышей в играх) запускается сам несколько раз в сутки — "
-        "остаток смотрите в /balance."
+        "остаток смотрите в /balance.\n"
+        f"🎂 В день рождения (дата в профиле, если бот её видит) — +{BIRTHDAY_GIFT_AMOUNT} "
+        f"{mimriks(BIRTHDAY_GIFT_AMOUNT)} при /balance, /daily или /start, не чаще раза в год (UTC+3)."
     )
 
 
@@ -350,10 +419,12 @@ async def register(message: types.Message):
         message.from_user.username or message.from_user.first_name,
     )
 
+    uid = message.from_user.id
+    gift = await _maybe_birthday_gift(uid, chat_id)
     if created:
-        await message.reply("🎉 Регистрация успешна! Вы получили 500 мимриков.")
+        await message.reply("🎉 Регистрация успешна! Вы получили 500 мимриков." + gift)
     else:
-        await message.reply("Вы уже зарегистрированы.")
+        await message.reply("Вы уже зарегистрированы." + gift)
 
 
 # баланс
@@ -367,6 +438,9 @@ async def balance(message: types.Message):
         await message.reply("Сначала зарегистрируйтесь /registration")
         return
 
+    gift = await _maybe_birthday_gift(message.from_user.id, message.chat.id)
+    if gift:
+        bal = await db.get_balance(message.from_user.id, message.chat.id)
     w = mimriks(bal)
     extra = ""
     if _golden_hour_active():
@@ -376,7 +450,7 @@ async def balance(message: types.Message):
             left = 0
         m, s = left // 60, left % 60
         extra = f"\n🌟 Золотой час: выигрыши ×2 ещё ~{m} мин {s} сек."
-    await message.reply(f"💰 Ваш баланс: {bal} {w}{extra}")
+    await message.reply(f"💰 Ваш баланс: {bal} {w}{extra}{gift}")
 
 
 # ставка
@@ -808,7 +882,7 @@ def _format_daily_quests_text(q: dict) -> str:
     rp = q.get("reward_password")
 
     lines = [
-        f"📅 Ежедневные задания ({q.get('day', '')})\n"
+        f"📅 Ежедневные задания, день {q.get('day', '')} (смена в 00:00 UTC+3)\n"
         f"Для зачёта в играх ставка от {DAILY_MIN_BET} {mimriks(DAILY_MIN_BET)}.\n",
         row(
             bool(rc),
@@ -873,7 +947,8 @@ async def daily_cmd(message: types.Message):
         await message.reply("Сначала /registration")
         return
     q = await db.get_daily_quest_snapshot(user_id, chat_id)
-    await message.reply(_format_daily_quests_text(q))
+    gift = await _maybe_birthday_gift(user_id, chat_id)
+    await message.reply(_format_daily_quests_text(q) + gift)
 
 
 def _mines_safe_cell_multiplier_label(state: dict, idx: int) -> str:

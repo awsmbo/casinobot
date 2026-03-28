@@ -1,7 +1,14 @@
 import json
 import os
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Optional
+
+# Календарный день для ежедневных заданий: полуночь UTC+3 (не зависит от TZ сервера)
+_DAILY_QUEST_TZ = timezone(timedelta(hours=3))
+
+
+def today_date_quest_tz() -> date:
+    return datetime.now(_DAILY_QUEST_TZ).date()
 
 import aiosqlite
 
@@ -131,6 +138,15 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS chat_admins(
             chat_id INTEGER PRIMARY KEY,
             admin_user_id INTEGER NOT NULL
+        )
+        """)
+
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS birthday_reward(
+            user_id INTEGER,
+            chat_id INTEGER,
+            last_year INTEGER NOT NULL,
+            PRIMARY KEY (user_id, chat_id)
         )
         """)
 
@@ -501,6 +517,33 @@ async def set_chat_thread(chat_id: int, thread_id: int | None):
         await db.commit()
 
 
+async def birthday_try_claim_year(user_id: int, chat_id: int, year: int) -> bool:
+    """Фиксирует подарок за день рождения в указанном году (календарь UTC+3).
+    True — запись обновлена, можно начислить деньги; False — в этом году уже выдавали."""
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute("BEGIN IMMEDIATE")
+        cur = await db.execute(
+            "SELECT last_year FROM birthday_reward WHERE user_id = ? AND chat_id = ?",
+            (user_id, chat_id),
+        )
+        row = await cur.fetchone()
+        if row and row[0] >= year:
+            await db.commit()
+            return False
+        if row:
+            await db.execute(
+                "UPDATE birthday_reward SET last_year = ? WHERE user_id = ? AND chat_id = ?",
+                (year, user_id, chat_id),
+            )
+        else:
+            await db.execute(
+                "INSERT INTO birthday_reward(user_id, chat_id, last_year) VALUES (?, ?, ?)",
+                (user_id, chat_id, year),
+            )
+        await db.commit()
+        return True
+
+
 async def get_chat_ids_with_users():
     """Возвращает список chat_id, в которых есть пользователи."""
     async with aiosqlite.connect(DB_NAME) as db_conn:
@@ -647,7 +690,7 @@ async def stats_record_transfer_sent(user_id: int, chat_id: int, amount: int) ->
 
 
 def today_str() -> str:
-    return date.today().isoformat()
+    return today_date_quest_tz().isoformat()
 
 
 async def _get_daily_row(user_id: int, chat_id: int, day: str):
