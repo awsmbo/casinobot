@@ -2,6 +2,7 @@ import asyncio
 import random
 import re
 import time
+import unicodedata
 from collections import Counter
 
 from aiogram import Bot, Dispatcher, types, F
@@ -61,6 +62,12 @@ DAILY_DICE_ROLLS = 50
 DAILY_PASSWORD_PLAYS = 20
 
 GOLDEN_HOUR_SECONDS = 3600
+# Случайная пауза после окончания окна до следующего старта (~в среднем 2–4 раза в сутки при часе длительности)
+GOLDEN_HOUR_GAP_MIN = int(3.5 * 3600)
+GOLDEN_HOUR_GAP_MAX = int(10 * 3600)
+GOLDEN_HOUR_FIRST_DELAY_MIN = int(3600)
+GOLDEN_HOUR_FIRST_DELAY_MAX = int(4 * 3600)
+
 PASSWORD_ATTEMPTS = 8
 PASSWORD_WIN_MULT = 10
 
@@ -81,23 +88,30 @@ def _apply_golden_hour_to_payout(payout: int) -> tuple[int, str]:
 
 def _password_feedback_states(secret: str, guess: str) -> list[str]:
     """hit — верная позиция; present — цифра есть в коде, не здесь; miss — нет в коде."""
-    s = list(secret)
-    g = list(guess)
-    state = ["miss"] * 5
-    for i in range(5):
+    s = list(unicodedata.normalize("NFC", secret))
+    g = list(unicodedata.normalize("NFC", guess))
+    n = len(s)
+    state = ["miss"] * n
+    for i in range(n):
         if g[i] == s[i]:
             state[i] = "hit"
-            s[i] = ""
-            g[i] = ""
-    cnt = Counter(c for c in s if c)
-    for i in range(5):
+            s[i] = None
+            g[i] = None
+    cnt = Counter(c for c in s if c is not None)
+    for i in range(n):
         if state[i] == "hit":
             continue
         ch = g[i]
-        if ch and cnt[ch] > 0:
+        if ch is None:
+            continue
+        if cnt[ch] > 0:
             state[i] = "present"
             cnt[ch] -= 1
     return state
+
+
+# Комбинирующее подчёркивание под цифрой (Telegram часто не рисует тег <u> у одиночных цифр)
+_COMB_UNDER = "\u0332"
 
 
 def _password_guess_html(secret: str, guess: str) -> str:
@@ -105,7 +119,7 @@ def _password_guess_html(secret: str, guess: str) -> str:
     parts: list[str] = []
     for i, d in enumerate(guess):
         if states[i] == "hit":
-            parts.append(f"<u>{d}</u>")
+            parts.append(f"<b>{d}{_COMB_UNDER}</b>")
         elif states[i] == "present":
             parts.append(d)
         else:
@@ -117,7 +131,8 @@ class ActivePasswordGuessFilter(BaseFilter):
     async def __call__(self, message: types.Message) -> bool:
         if not message.from_user or not message.text:
             return False
-        if not re.fullmatch(r"\d{5}", message.text.strip()):
+        # Только ASCII 0–9: иначе «похожие» юникод-цифры не совпадут с кодом сейфа
+        if not re.fullmatch(r"[0-9]{5}", message.text.strip()):
             return False
         key = (message.chat.id, message.from_user.id)
         return key in password_games
@@ -272,7 +287,8 @@ def _private_instructions() -> str:
         "4. Когда все готовы — нажмите кнопку «Запустить» под сообщением со ставками\n"
         "5. Победитель определяется случайно (чем больше ставка — тем выше шанс)\n\n"
         "Другие команды: /transfer, /coinflip, /slot, /dice, /mines, /password, /rob, /stats, /daily, /leaderboard\n"
-        "Сундуки появляются случайно!\n\n"
+        "Сундуки появляются случайно!\n"
+        "🌟 Золотой час (×2 к выигрышам в играх) включается сам несколько раз в сутки — смотрите /balance.\n\n"
         f"🔗 Исходный код: {GITHUB_URL}"
     )
 
@@ -317,8 +333,8 @@ async def help_cmd(message: types.Message):
         "/daily — ежедневные задания\n"
         "/leaderboard — топ игроков\n"
         "Сундуки появляются случайно в чате!\n\n"
-        "Админ казино (кто добавил бота): /golden_hour — час с удвоением выигрышей, "
-        "/golden_hour_stop — отмена."
+        "🌟 Золотой час (удвоение выигрышей в играх) запускается сам несколько раз в сутки — "
+        "остаток смотрите в /balance."
     )
 
 
@@ -1671,8 +1687,8 @@ async def password_cmd(message: types.Message):
         f"Попыток: {PASSWORD_ATTEMPTS}. Угадать весь код — выигрыш ×{PASSWORD_WIN_MULT}.\n\n"
         "Отправьте ровно 5 цифр одним сообщением, например: <code>90452</code>\n\n"
         "Как читать подсказку:\n"
-        "• <u>подчёркнутая</u> — верная цифра и позиция\n"
-        "• без выделения — цифра есть в коде, но не здесь\n"
+        f"• <b>жирная цифра с линией снизу (пример: 3{_COMB_UNDER})</b> — верная цифра и позиция\n"
+        "• без выделения — цифра есть в коде, но не на этом месте\n"
         "• <s>зачёркнутая</s> — такой цифры в коде нет",
         parse_mode="HTML",
     )
@@ -1687,7 +1703,7 @@ async def password_guess(message: types.Message):
     if not st:
         return
 
-    guess = (message.text or "").strip()
+    guess = unicodedata.normalize("NFC", (message.text or "").strip())
     secret = st["secret"]
     bet = st["bet"]
     user_id = message.from_user.id
@@ -1751,50 +1767,38 @@ async def password_guess(message: types.Message):
     )
 
 
-async def _golden_hour_check_admin(message: types.Message) -> bool:
-    if message.chat.type not in ("group", "supergroup"):
-        return False
-    inviter = await db.get_chat_admin(message.chat.id)
-    if inviter is None or message.from_user.id != inviter:
-        return False
-    return True
+async def golden_hour_scheduler_task():
+    """Включает золотой час по расписанию: случайные интервалы, несколько раз в сутки."""
+    while True:
+        try:
+            await asyncio.sleep(45)
+            now = time.time()
+            try:
+                until = float(get("golden_hour_until", 0) or 0)
+            except (TypeError, ValueError):
+                until = 0.0
+            try:
+                next_start = float(get("golden_hour_next_start", 0) or 0)
+            except (TypeError, ValueError):
+                next_start = 0.0
 
+            if until > now:
+                continue
 
-@dp.message(Command("golden_hour"))
-async def golden_hour_cmd(message: types.Message):
-    """Админ чата: на час включает удвоение выигрышей во всех играх (глобально для бота)."""
-    if not await _thread_allowed(message):
-        return
-    if not await _golden_hour_check_admin(message):
-        if message.chat.type in ("group", "supergroup"):
-            await message.reply(
-                "Запустить золотой час может только тот, кто добавил бота в этот чат "
-                "(команда из группы)."
-            )
-        else:
-            await message.reply("Команда только из группы, от админа казино (кто добавил бота).")
-        return
+            if next_start <= 0:
+                delay = random.uniform(GOLDEN_HOUR_FIRST_DELAY_MIN, GOLDEN_HOUR_FIRST_DELAY_MAX)
+                set_value("golden_hour_next_start", now + delay)
+                continue
 
-    until = time.time() + GOLDEN_HOUR_SECONDS
-    set_value("golden_hour_until", until)
-    m = GOLDEN_HOUR_SECONDS // 60
-    await message.reply(
-        f"🌟 Золотой час на {m} минут! Во всех чатах этого бота выигрыши в играх начисляются ×2.\n"
-        "Остаток времени: /balance. Остановить: /golden_hour_stop."
-    )
+            if now < next_start:
+                continue
 
-
-@dp.message(Command("golden_hour_stop"))
-async def golden_hour_stop_cmd(message: types.Message):
-    if not await _thread_allowed(message):
-        return
-    if not await _golden_hour_check_admin(message):
-        if message.chat.type in ("group", "supergroup"):
-            await message.reply("Остановить может только админ казино (кто добавил бота).")
-        return
-
-    set_value("golden_hour_until", 0.0)
-    await message.reply("Золотой час выключен.")
+            new_until = now + GOLDEN_HOUR_SECONDS
+            gap = random.uniform(GOLDEN_HOUR_GAP_MIN, GOLDEN_HOUR_GAP_MAX)
+            set_value("golden_hour_until", new_until)
+            set_value("golden_hour_next_start", new_until + gap)
+        except Exception:
+            await asyncio.sleep(60)
 
 
 # админ: настройки (только в личке)
@@ -2286,8 +2290,6 @@ BOT_COMMANDS = [
     BotCommand(command="leaderboard", description="Топ игроков"),
     BotCommand(command="spin", description="(админ) Запустить колесо"),
     BotCommand(command="password", description="Взлом сейфа: код из 5 цифр, ×10"),
-    BotCommand(command="golden_hour", description="(админ) Час ×2 на выигрыши"),
-    BotCommand(command="golden_hour_stop", description="(админ) Выключить золотой час"),
 ]
 
 
@@ -2297,6 +2299,7 @@ async def main():
     await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeDefault())
     await bot.set_my_commands(BOT_COMMANDS, scope=BotCommandScopeAllGroupChats())
     asyncio.create_task(chest_spawn_task())
+    asyncio.create_task(golden_hour_scheduler_task())
     await dp.start_polling(bot)
 
 
