@@ -68,7 +68,7 @@ GOLDEN_HOUR_GAP_MAX = int(10 * 3600)
 GOLDEN_HOUR_FIRST_DELAY_MIN = int(3600)
 GOLDEN_HOUR_FIRST_DELAY_MAX = int(4 * 3600)
 
-PASSWORD_ATTEMPTS = 8
+PASSWORD_ATTEMPTS = 5
 PASSWORD_WIN_MULT = 10
 
 
@@ -328,7 +328,7 @@ async def help_cmd(message: types.Message):
         "/slot <ставка> — слот (куб 🎰)\n"
         "/dice <ставка> <1-6> — угадать кубик 🎲, при угадывании ×10\n"
         "/rob @user — попытаться украсть мимрики (10% шанс, 1 раз в 30 мин)\n"
-        "/password <ставка> — взлом сейфа: угадать 5-значный код за 8 попыток (×10)\n"
+        "/password <ставка> — взлом сейфа: угадать 5-значный код за 5 попыток (×10)\n"
         "/stats — ваша статистика\n"
         "/daily — ежедневные задания\n"
         "/leaderboard — топ игроков\n"
@@ -2289,7 +2289,7 @@ BOT_COMMANDS = [
     BotCommand(command="daily", description="Ежедневные задания"),
     BotCommand(command="leaderboard", description="Топ игроков"),
     BotCommand(command="spin", description="(админ) Запустить колесо"),
-    BotCommand(command="password", description="Взлом сейфа: код из 5 цифр, ×10"),
+    BotCommand(command="password", description="Взлом сейфа: 5 цифр, 5 попыток, ×10"),
 ]
 
 
