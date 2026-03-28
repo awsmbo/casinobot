@@ -23,6 +23,8 @@ DEFAULTS = {
         (10000, 9),
         (100000, 1),
     ],
+    # Золотой час: unix timestamp окончания (0 = выключено). Ставится командой /golden_hour
+    "golden_hour_until": 0.0,
 }
 
 

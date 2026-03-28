@@ -1,9 +1,11 @@
 import asyncio
 import random
+import re
 import time
+from collections import Counter
 
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.filters import BaseFilter, Command
 from aiogram.types import (
     BotCommand,
     BotCommandScopeAllGroupChats,
@@ -32,6 +34,9 @@ roulette_rounds = {}
 # Сапёр: (chat_id, user_id) -> состояние игры
 mines_games = {}
 
+# Взлом сейфа: (chat_id, user_id) -> состояние
+password_games: dict[tuple[int, int], dict] = {}
+
 MINES_GRID_SIDE = 5
 MINES_GRID = MINES_GRID_SIDE * MINES_GRID_SIDE  # 25
 MINES_SAFE_TOTAL = 10
@@ -53,6 +58,69 @@ DAILY_ROULETTE_WINS = 10
 DAILY_MINES_PLAYS = 10
 DAILY_SLOT_SPINS = 50
 DAILY_DICE_ROLLS = 50
+DAILY_PASSWORD_PLAYS = 20
+
+GOLDEN_HOUR_SECONDS = 3600
+PASSWORD_ATTEMPTS = 8
+PASSWORD_WIN_MULT = 10
+
+
+def _golden_hour_active() -> bool:
+    until = get("golden_hour_until", 0)
+    try:
+        return time.time() < float(until)
+    except (TypeError, ValueError):
+        return False
+
+
+def _apply_golden_hour_to_payout(payout: int) -> tuple[int, str]:
+    if payout <= 0 or not _golden_hour_active():
+        return payout, ""
+    return payout * 2, "\n🌟 Золотой час: выигрыш ×2!"
+
+
+def _password_feedback_states(secret: str, guess: str) -> list[str]:
+    """hit — верная позиция; present — цифра есть в коде, не здесь; miss — нет в коде."""
+    s = list(secret)
+    g = list(guess)
+    state = ["miss"] * 5
+    for i in range(5):
+        if g[i] == s[i]:
+            state[i] = "hit"
+            s[i] = ""
+            g[i] = ""
+    cnt = Counter(c for c in s if c)
+    for i in range(5):
+        if state[i] == "hit":
+            continue
+        ch = g[i]
+        if ch and cnt[ch] > 0:
+            state[i] = "present"
+            cnt[ch] -= 1
+    return state
+
+
+def _password_guess_html(secret: str, guess: str) -> str:
+    states = _password_feedback_states(secret, guess)
+    parts: list[str] = []
+    for i, d in enumerate(guess):
+        if states[i] == "hit":
+            parts.append(f"<u>{d}</u>")
+        elif states[i] == "present":
+            parts.append(d)
+        else:
+            parts.append(f"<s>{d}</s>")
+    return " ".join(parts)
+
+
+class ActivePasswordGuessFilter(BaseFilter):
+    async def __call__(self, message: types.Message) -> bool:
+        if not message.from_user or not message.text:
+            return False
+        if not re.fullmatch(r"\d{5}", message.text.strip()):
+            return False
+        key = (message.chat.id, message.from_user.id)
+        return key in password_games
 
 
 def _mines_cumulative_multiplier(safe_opened: int) -> float:
@@ -203,7 +271,7 @@ def _private_instructions() -> str:
         "3. Делайте ставки: /bet 100\n"
         "4. Когда все готовы — нажмите кнопку «Запустить» под сообщением со ставками\n"
         "5. Победитель определяется случайно (чем больше ставка — тем выше шанс)\n\n"
-        "Другие команды: /transfer, /coinflip, /slot, /dice, /mines, /rob, /stats, /daily, /leaderboard\n"
+        "Другие команды: /transfer, /coinflip, /slot, /dice, /mines, /password, /rob, /stats, /daily, /leaderboard\n"
         "Сундуки появляются случайно!\n\n"
         f"🔗 Исходный код: {GITHUB_URL}"
     )
@@ -244,10 +312,13 @@ async def help_cmd(message: types.Message):
         "/slot <ставка> — слот (куб 🎰)\n"
         "/dice <ставка> <1-6> — угадать кубик 🎲, при угадывании ×10\n"
         "/rob @user — попытаться украсть мимрики (10% шанс, 1 раз в 30 мин)\n"
+        "/password <ставка> — взлом сейфа: угадать 5-значный код за 8 попыток (×10)\n"
         "/stats — ваша статистика\n"
         "/daily — ежедневные задания\n"
         "/leaderboard — топ игроков\n"
-        "Сундуки появляются случайно в чате!"
+        "Сундуки появляются случайно в чате!\n\n"
+        "Админ казино (кто добавил бота): /golden_hour — час с удвоением выигрышей, "
+        "/golden_hour_stop — отмена."
     )
 
 
@@ -281,7 +352,15 @@ async def balance(message: types.Message):
         return
 
     w = mimriks(bal)
-    await message.reply(f"💰 Ваш баланс: {bal} {w}")
+    extra = ""
+    if _golden_hour_active():
+        try:
+            left = max(0, int(float(get("golden_hour_until", 0)) - time.time()))
+        except (TypeError, ValueError):
+            left = 0
+        m, s = left // 60, left % 60
+        extra = f"\n🌟 Золотой час: выигрыши ×2 ещё ~{m} мин {s} сек."
+    await message.reply(f"💰 Ваш баланс: {bal} {w}{extra}")
 
 
 # ставка
@@ -479,8 +558,11 @@ async def coinflip(message: types.Message):
     await db.change_balance(user_id, chat_id, -amount)
 
     if random.random() < 0.5:
-        await db.change_balance(user_id, chat_id, amount * 2)
-        await db.stats_record_game(user_id, chat_id, "coinflip", net_won=amount, net_lost=0)
+        payout, gh_note = _apply_golden_hour_to_payout(amount * 2)
+        await db.change_balance(user_id, chat_id, payout)
+        await db.stats_record_game(
+            user_id, chat_id, "coinflip", net_won=max(0, payout - amount), net_lost=0
+        )
         if amount >= DAILY_MIN_BET:
             r = await db.daily_quest_bump_coinflip(
                 user_id, chat_id, DAILY_QUEST_REWARD, DAILY_COINFLIP_PLAYS
@@ -488,9 +570,11 @@ async def coinflip(message: types.Message):
             if r:
                 await db.change_balance(user_id, chat_id, r)
         bal = await db.get_balance(user_id, chat_id)
-        w = mimriks(amount * 2)
-        await message.reply(f"🪙 Орёл! Вы выиграли {amount * 2} {w}!\n"
-        f"Ваш баланс: {bal} {mimriks(bal)}")
+        w = mimriks(payout)
+        await message.reply(
+            f"🪙 Орёл! Вы выиграли {payout} {w}!{gh_note}\n"
+            f"Ваш баланс: {bal} {mimriks(bal)}"
+        )
     else:
         await db.stats_record_game(user_id, chat_id, "coinflip", net_won=0, net_lost=amount)
         if amount >= DAILY_MIN_BET:
@@ -555,14 +639,15 @@ async def slot_cmd(message: types.Message):
         )
         return
 
-    gross = int(amount * mult)
+    gross_base = int(amount * mult)
+    gross, gh_note = _apply_golden_hour_to_payout(gross_base)
     await db.change_balance(user_id, chat_id, gross)
     profit = gross - amount
     await db.stats_record_game(user_id, chat_id, "slot", net_won=max(0, profit), net_lost=0)
     bal2 = await db.get_balance(user_id, chat_id)
     await message.reply(
         f"{label} (куб: {val})\n"
-        f"Выплата: {gross} {mimriks(gross)} (чистыми +{profit}).\n"
+        f"Выплата: {gross} {mimriks(gross)} (чистыми +{profit}).{gh_note}\n"
         f"Баланс: {bal2} {mimriks(bal2)}"
     )
 
@@ -621,14 +706,15 @@ async def dice_cmd(message: types.Message):
         )
         return
 
-    gross = amount * DICE_WIN_MULTIPLIER
+    gross_base = amount * DICE_WIN_MULTIPLIER
+    gross, gh_note = _apply_golden_hour_to_payout(gross_base)
     await db.change_balance(user_id, chat_id, gross)
     profit = gross - amount
     await db.stats_record_game(user_id, chat_id, "dice", net_won=max(0, profit), net_lost=0)
     bal2 = await db.get_balance(user_id, chat_id)
     await message.reply(
         f"Выпало {val}. Угадали! ×{DICE_WIN_MULTIPLIER}\n"
-        f"Выплата: {gross} {mimriks(gross)} (чистыми +{profit}).\n"
+        f"Выплата: {gross} {mimriks(gross)} (чистыми +{profit}).{gh_note}\n"
         f"Баланс: {bal2} {mimriks(bal2)}"
     )
 
@@ -659,6 +745,7 @@ def _format_user_stats_text(s: dict) -> str:
         line("roulette", "Рулетка"),
         line("slot", "Слот"),
         line("dice", "Кубик"),
+        line("password", "Взлом сейфа"),
         "",
         f"Всего выиграно (нетто по играм): {totals.get('won', 0)}",
         f"Всего проиграно: {totals.get('lost', 0)}",
@@ -702,6 +789,7 @@ def _format_daily_quests_text(q: dict) -> str:
     rm = q.get("reward_mines")
     rs = q.get("reward_slot")
     rd = q.get("reward_dice")
+    rp = q.get("reward_password")
 
     lines = [
         f"📅 Ежедневные задания ({q.get('day', '')})\n"
@@ -746,6 +834,13 @@ def _format_daily_quests_text(q: dict) -> str:
             q.get("dice_plays", 0),
             DAILY_DICE_ROLLS,
             f"Сыграть в /dice {DAILY_DICE_ROLLS} раз",
+            f"награда {DAILY_QUEST_REWARD}",
+        ),
+        row(
+            bool(rp),
+            q.get("password_plays", 0),
+            DAILY_PASSWORD_PLAYS,
+            f"Сыграть в /password {DAILY_PASSWORD_PLAYS} раз",
             f"награда {DAILY_QUEST_REWARD}",
         ),
     ]
@@ -933,6 +1028,10 @@ async def mines_cmd(message: types.Message):
         await message.reply("У вас уже идёт партия сапёра. Сначала закончите её.")
         return
 
+    if key in password_games:
+        await message.reply("У вас идёт взлом сейфа. Сначала закончите или проиграйте.")
+        return
+
     bal = await db.get_balance(user_id, chat_id)
     if bal is None:
         await message.reply("Сначала /registration")
@@ -1006,7 +1105,8 @@ async def mines_callback(callback: CallbackQuery):
             await callback.answer("Сначала откройте хотя бы одну безопасную клетку.", show_alert=True)
             return
         mult = _mines_cumulative_multiplier(state["safe_opened"])
-        win = int(state["amount"] * mult)
+        win_base = int(state["amount"] * mult)
+        win, _gh = _apply_golden_hour_to_payout(win_base)
         await db.change_balance(user_id, chat_id, win)
         await _mines_record_end(user_id, chat_id, state["amount"], won=True, payout=win)
         await _mines_finish(chat_id, state["message_id"], key, state, win=True)
@@ -1042,7 +1142,8 @@ async def mines_callback(callback: CallbackQuery):
 
     if state["safe_opened"] >= total_safe:
         mult = _mines_cumulative_multiplier(state["safe_opened"])
-        win = int(state["amount"] * mult)
+        win_base = int(state["amount"] * mult)
+        win, _gh = _apply_golden_hour_to_payout(win_base)
         await db.change_balance(user_id, chat_id, win)
         await _mines_record_end(user_id, chat_id, state["amount"], won=True, payout=win)
         await _mines_finish(chat_id, state["message_id"], key, state, win=True)
@@ -1147,6 +1248,7 @@ async def _roulette_round_runner(chat_id: int):
         bet_number = bet["bet_number"]
 
         win = 0
+        win_paid = 0
         reason = ""
 
         if bet_type == "color":
@@ -1172,9 +1274,10 @@ async def _roulette_round_runner(chat_id: int):
                 reason = "не угадал число"
 
         if win > 0:
-            await db.change_balance(uid, chat_id, win)
-            user_wins[uid] = user_wins.get(uid, 0) + win
-            await db.stats_record_game(uid, chat_id, "roulette", net_won=win, net_lost=0)
+            win_paid, _gh = _apply_golden_hour_to_payout(win)
+            await db.change_balance(uid, chat_id, win_paid)
+            user_wins[uid] = user_wins.get(uid, 0) + win_paid
+            await db.stats_record_game(uid, chat_id, "roulette", net_won=win_paid, net_lost=0)
             if amount >= DAILY_MIN_BET:
                 r = await db.daily_quest_bump_roulette_win(
                     uid, chat_id, DAILY_QUEST_REWARD, DAILY_ROULETTE_WINS
@@ -1201,9 +1304,10 @@ async def _roulette_round_runner(chat_id: int):
         else:
             bet_desc = f"число {bet_number}"
 
+        gh_tag = " (×2 золотой час!)" if win > 0 and win_paid > win else ""
         results_lines.append(
             f"- {user_name}: ставка {amount} на {bet_desc} — {reason}"
-            + (f", выигрыш {win}" if win > 0 else "")
+            + (f", выигрыш {win_paid}{gh_tag}" if win > 0 else "")
         )
 
     # Отправляем сводку в чат отдельным сообщением
@@ -1498,9 +1602,10 @@ async def rob(message: types.Message):
         return
 
     steal_amount = max(1, int(target_bal * steal_pct))
+    rob_payout, gh_note = _apply_golden_hour_to_payout(steal_amount)
     await db.change_balance(target_id, chat_id, -steal_amount)
-    await db.change_balance(user_id, chat_id, steal_amount)
-    await db.stats_record_rob_success_robber(user_id, chat_id, steal_amount)
+    await db.change_balance(user_id, chat_id, rob_payout)
+    await db.stats_record_rob_success_robber(user_id, chat_id, rob_payout)
     await db.stats_record_rob_victim(target_id, chat_id, steal_amount)
     r = await db.daily_quest_bump_rob_success(
         user_id, chat_id, DAILY_QUEST_REWARD, DAILY_ROB_SUCCESS
@@ -1508,8 +1613,188 @@ async def rob(message: types.Message):
     if r:
         await db.change_balance(user_id, chat_id, r)
 
-    w = mimriks(steal_amount)
-    await message.reply(f"💰 Кража удалась! Вы украли {steal_amount} {w}!")
+    w = mimriks(rob_payout)
+    await message.reply(
+        f"💰 Кража удалась! Вы получили {rob_payout} {w}!{gh_note}"
+    )
+
+
+@dp.message(Command("password"))
+async def password_cmd(message: types.Message):
+    """Взлом сейфа: Mastermind по 5 цифрам, до PASSWORD_ATTEMPTS попыток, выигрыш ×PASSWORD_WIN_MULT."""
+    if not await _thread_allowed(message):
+        await message.reply("Используйте команду в разрешённой теме чата (если задана).")
+        return
+    args = (message.text or "").split()
+    if len(args) != 2:
+        await message.reply("Использование: /password <ставка>")
+        return
+    try:
+        amount = int(args[1])
+    except ValueError:
+        await message.reply("Ставка должна быть числом.")
+        return
+    if amount < 1:
+        await message.reply("Минимальная ставка — 1 мимрик.")
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    key = (chat_id, user_id)
+
+    if key in password_games:
+        await message.reply(
+            "У вас уже идёт взлом сейфа. Отправляйте 5 цифр или дождитесь окончания попыток."
+        )
+        return
+
+    mines = mines_games.get(key)
+    if mines and mines.get("active"):
+        await message.reply("Сначала закончите партию в сапёре.")
+        return
+
+    bal = await db.get_balance(user_id, chat_id)
+    if bal is None:
+        await message.reply("Сначала /registration")
+        return
+    if amount > bal:
+        await message.reply(f"Недостаточно {mimriks(amount)}.")
+        return
+
+    await db.change_balance(user_id, chat_id, -amount)
+    secret = "".join(random.choices("0123456789", k=5))
+    password_games[key] = {"secret": secret, "bet": amount, "left": PASSWORD_ATTEMPTS}
+
+    await message.reply(
+        "🔐 Взлом сейфа!\n"
+        f"Ставка {amount} {mimriks(amount)} снята. Угадайте 5-значный код (цифры 0–9).\n"
+        f"Попыток: {PASSWORD_ATTEMPTS}. Угадать весь код — выигрыш ×{PASSWORD_WIN_MULT}.\n\n"
+        "Отправьте ровно 5 цифр одним сообщением, например: <code>90452</code>\n\n"
+        "Как читать подсказку:\n"
+        "• <u>подчёркнутая</u> — верная цифра и позиция\n"
+        "• без выделения — цифра есть в коде, но не здесь\n"
+        "• <s>зачёркнутая</s> — такой цифры в коде нет",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(ActivePasswordGuessFilter())
+async def password_guess(message: types.Message):
+    if not await _thread_allowed(message):
+        return
+    key = (message.chat.id, message.from_user.id)
+    st = password_games.get(key)
+    if not st:
+        return
+
+    guess = (message.text or "").strip()
+    secret = st["secret"]
+    bet = st["bet"]
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    if guess == secret:
+        base_win = bet * PASSWORD_WIN_MULT
+        payout, gh_note = _apply_golden_hour_to_payout(base_win)
+        await db.change_balance(user_id, chat_id, payout)
+        password_games.pop(key, None)
+        await db.stats_record_game(
+            user_id,
+            chat_id,
+            "password",
+            net_won=max(0, payout - bet),
+            net_lost=0,
+        )
+        if bet >= DAILY_MIN_BET:
+            r = await db.daily_quest_bump_password_play(
+                user_id, chat_id, DAILY_QUEST_REWARD, DAILY_PASSWORD_PLAYS
+            )
+            if r:
+                await db.change_balance(user_id, chat_id, r)
+        bal = await db.get_balance(user_id, chat_id)
+        await message.reply(
+            "🔓 Сейф открыт! Код угадан.\n"
+            f"Выигрыш: {payout} {mimriks(payout)} (ставка {bet}).{gh_note}\n"
+            f"Баланс: {bal} {mimriks(bal)}"
+        )
+        return
+
+    st["left"] -= 1
+    left = st["left"]
+    line = _password_guess_html(secret, guess)
+
+    if left <= 0:
+        password_games.pop(key, None)
+        await db.stats_record_game(
+            user_id,
+            chat_id,
+            "password",
+            net_won=0,
+            net_lost=bet,
+        )
+        if bet >= DAILY_MIN_BET:
+            r = await db.daily_quest_bump_password_play(
+                user_id, chat_id, DAILY_QUEST_REWARD, DAILY_PASSWORD_PLAYS
+            )
+            if r:
+                await db.change_balance(user_id, chat_id, r)
+        await message.reply(
+            f"💀 Попытки кончились. Код был: <code>{secret}</code>\n"
+            f"Ваш ход: {line}",
+            parse_mode="HTML",
+        )
+        return
+
+    await message.reply(
+        f"{line}\n\nОсталось попыток: {left}",
+        parse_mode="HTML",
+    )
+
+
+async def _golden_hour_check_admin(message: types.Message) -> bool:
+    if message.chat.type not in ("group", "supergroup"):
+        return False
+    inviter = await db.get_chat_admin(message.chat.id)
+    if inviter is None or message.from_user.id != inviter:
+        return False
+    return True
+
+
+@dp.message(Command("golden_hour"))
+async def golden_hour_cmd(message: types.Message):
+    """Админ чата: на час включает удвоение выигрышей во всех играх (глобально для бота)."""
+    if not await _thread_allowed(message):
+        return
+    if not await _golden_hour_check_admin(message):
+        if message.chat.type in ("group", "supergroup"):
+            await message.reply(
+                "Запустить золотой час может только тот, кто добавил бота в этот чат "
+                "(команда из группы)."
+            )
+        else:
+            await message.reply("Команда только из группы, от админа казино (кто добавил бота).")
+        return
+
+    until = time.time() + GOLDEN_HOUR_SECONDS
+    set_value("golden_hour_until", until)
+    m = GOLDEN_HOUR_SECONDS // 60
+    await message.reply(
+        f"🌟 Золотой час на {m} минут! Во всех чатах этого бота выигрыши в играх начисляются ×2.\n"
+        "Остаток времени: /balance. Остановить: /golden_hour_stop."
+    )
+
+
+@dp.message(Command("golden_hour_stop"))
+async def golden_hour_stop_cmd(message: types.Message):
+    if not await _thread_allowed(message):
+        return
+    if not await _golden_hour_check_admin(message):
+        if message.chat.type in ("group", "supergroup"):
+            await message.reply("Остановить может только админ казино (кто добавил бота).")
+        return
+
+    set_value("golden_hour_until", 0.0)
+    await message.reply("Золотой час выключен.")
 
 
 # админ: настройки (только в личке)
@@ -1727,17 +2012,21 @@ async def _do_spin(chat_id: int, msg_to_edit: types.Message):
     winner = random.choices(users, weights=weights, k=1)[0]
     winner_id, winner_name = winner
 
-    await db.change_balance(winner_id, chat_id, total_bank)
+    payout, gh_note = _apply_golden_hour_to_payout(total_bank)
+    await db.change_balance(winner_id, chat_id, payout)
     for b in bets:
         uid, _name, bet_amt = b[0], b[1], b[2]
         if uid == winner_id:
-            await db.stats_record_game(uid, chat_id, "round", net_won=total_bank - bet_amt, net_lost=0)
+            await db.stats_record_game(
+                uid, chat_id, "round", net_won=payout - bet_amt, net_lost=0
+            )
         else:
             await db.stats_record_game(uid, chat_id, "round", net_won=0, net_lost=bet_amt)
     await db.clear_bets(chat_id)
     await db.clear_round_message(chat_id)
 
-    w = mimriks(total_bank)
+    w = mimriks(payout)
+    gh_line = f"\n{gh_note.strip()}" if gh_note else ""
 
     # Определяем, в какой подчат отправить результат
     message_thread_id = None
@@ -1754,7 +2043,7 @@ async def _do_spin(chat_id: int, msg_to_edit: types.Message):
             chat_id,
             f"🎰 Результат раунда ставок:\n\n"
             f"🏆 Победитель: {winner_name}\n"
-            f"💰 Выигрыш: {total_bank} {w}",
+            f"💰 Выигрыш: {payout} {w}{gh_line}",
             message_thread_id=message_thread_id,
         )
     except Exception:
@@ -1798,17 +2087,21 @@ async def spin(message: types.Message):
     winner = random.choices(users, weights=weights, k=1)[0]
     winner_id, winner_name = winner
 
-    await db.change_balance(winner_id, chat_id, total_bank)
+    payout, gh_note = _apply_golden_hour_to_payout(total_bank)
+    await db.change_balance(winner_id, chat_id, payout)
     for b in bets:
         uid, _name, bet_amt = b[0], b[1], b[2]
         if uid == winner_id:
-            await db.stats_record_game(uid, chat_id, "round", net_won=total_bank - bet_amt, net_lost=0)
+            await db.stats_record_game(
+                uid, chat_id, "round", net_won=payout - bet_amt, net_lost=0
+            )
         else:
             await db.stats_record_game(uid, chat_id, "round", net_won=0, net_lost=bet_amt)
     await db.clear_bets(chat_id)
     await db.clear_round_message(chat_id)
 
-    w = mimriks(total_bank)
+    w = mimriks(payout)
+    gh_line = f"\n{gh_note.strip()}" if gh_note else ""
 
     # Определяем подчат для результата
     message_thread_id = None
@@ -1824,7 +2117,7 @@ async def spin(message: types.Message):
             chat_id,
             f"🎰 Результат раунда ставок (админский спин):\n\n"
             f"🏆 Победитель: {winner_name}\n"
-            f"💰 Выигрыш: {total_bank} {w}",
+            f"💰 Выигрыш: {payout} {w}{gh_line}",
             message_thread_id=message_thread_id,
         )
     except Exception:
@@ -1992,6 +2285,9 @@ BOT_COMMANDS = [
     BotCommand(command="daily", description="Ежедневные задания"),
     BotCommand(command="leaderboard", description="Топ игроков"),
     BotCommand(command="spin", description="(админ) Запустить колесо"),
+    BotCommand(command="password", description="Взлом сейфа: код из 5 цифр, ×10"),
+    BotCommand(command="golden_hour", description="(админ) Час ×2 на выигрыши"),
+    BotCommand(command="golden_hour_stop", description="(админ) Выключить золотой час"),
 ]
 
 
