@@ -42,6 +42,8 @@ MINES_MULT_STEP = (100.0 / MINES_MULT_FIRST) ** (1.0 / 9.0)
 MINES_MULTIPLIERS = [MINES_MULT_FIRST] + [MINES_MULT_STEP] * 9
 
 SLOT_ANIMATION_SECONDS = 3.5
+DICE_ANIMATION_SECONDS = 3.5
+DICE_WIN_MULTIPLIER = 10
 
 DAILY_MIN_BET = 1000
 DAILY_QUEST_REWARD = 10_000
@@ -50,6 +52,7 @@ DAILY_ROB_SUCCESS = 1
 DAILY_ROULETTE_WINS = 10
 DAILY_MINES_PLAYS = 10
 DAILY_SLOT_SPINS = 50
+DAILY_DICE_ROLLS = 50
 
 
 def _mines_cumulative_multiplier(safe_opened: int) -> float:
@@ -200,7 +203,7 @@ def _private_instructions() -> str:
         "3. Делайте ставки: /bet 100\n"
         "4. Когда все готовы — нажмите кнопку «Запустить» под сообщением со ставками\n"
         "5. Победитель определяется случайно (чем больше ставка — тем выше шанс)\n\n"
-        "Другие команды: /transfer, /coinflip, /slot, /mines, /rob, /stats, /daily, /leaderboard\n"
+        "Другие команды: /transfer, /coinflip, /slot, /dice, /mines, /rob, /stats, /daily, /leaderboard\n"
         "Сундуки появляются случайно!\n\n"
         f"🔗 Исходный код: {GITHUB_URL}"
     )
@@ -239,6 +242,7 @@ async def help_cmd(message: types.Message):
         "/coinflip <сумма> — 50/50: проиграть или удвоить\n"
         "/mines <ставка> — сапёр 5×5: 10 безопасных клеток, до ×100\n"
         "/slot <ставка> — слот (куб 🎰)\n"
+        "/dice <ставка> <1-6> — угадать кубик 🎲, при угадывании ×10\n"
         "/rob @user — попытаться украсть мимрики (10% шанс, 1 раз в 30 мин)\n"
         "/stats — ваша статистика\n"
         "/daily — ежедневные задания\n"
@@ -563,6 +567,72 @@ async def slot_cmd(message: types.Message):
     )
 
 
+@dp.message(Command("dice"))
+async def dice_cmd(message: types.Message):
+    if not await _thread_allowed(message):
+        return
+    args = (message.text or "").split()
+    if len(args) != 3:
+        await message.reply("Использование: /dice <сумма> <число 1-6>")
+        return
+    try:
+        amount = int(args[1])
+        guess = int(args[2])
+    except ValueError:
+        await message.reply("Сумма и число должны быть целыми.")
+        return
+    if amount < 1:
+        await message.reply("Минимальная ставка — 1 мимрик.")
+        return
+    if guess < 1 or guess > 6:
+        await message.reply("Укажите число от 1 до 6.")
+        return
+
+    chat_id = message.chat.id
+    user_id = message.from_user.id
+    bal = await db.get_balance(user_id, chat_id)
+    if bal is None:
+        await message.reply("Сначала /registration")
+        return
+    if amount > bal:
+        await message.reply(f"Недостаточно {mimriks(amount)}.")
+        return
+
+    await db.change_balance(user_id, chat_id, -amount)
+    dice_msg = await message.answer_dice(emoji="🎲")
+    await asyncio.sleep(DICE_ANIMATION_SECONDS)
+    val = dice_msg.dice.value if dice_msg.dice else 0
+    hit = 1 <= val <= 6 and val == guess
+
+    if amount >= DAILY_MIN_BET:
+        r = await db.daily_quest_bump_dice_play(
+            user_id, chat_id, DAILY_QUEST_REWARD, DAILY_DICE_ROLLS
+        )
+        if r:
+            await db.change_balance(user_id, chat_id, r)
+
+    if not hit:
+        await db.stats_record_game(user_id, chat_id, "dice", net_won=0, net_lost=amount)
+        bal2 = await db.get_balance(user_id, chat_id)
+        await message.reply(
+            f"Выпало {val}. Вы ставили на {guess} — не угадали.\n"
+            f"Ставка {amount} {mimriks(amount)} не окупилась.\n"
+            f"Баланс: {bal2} {mimriks(bal2)}"
+        )
+        return
+
+    gross = amount * DICE_WIN_MULTIPLIER
+    await db.change_balance(user_id, chat_id, gross)
+    profit = gross - amount
+    await db.stats_record_game(user_id, chat_id, "dice", net_won=max(0, profit), net_lost=0)
+    bal2 = await db.get_balance(user_id, chat_id)
+    await message.reply(
+        f"Выпало {val}. Угадали! ×{DICE_WIN_MULTIPLIER}\n"
+        f"Выплата: {gross} {mimriks(gross)} (чистыми +{profit}).\n"
+        f"Баланс: {bal2} {mimriks(bal2)}"
+    )
+
+
 def _format_user_stats_text(s: dict) -> str:
     plays = s.get("plays") or {}
     won = s.get("won") or {}
@@ -588,6 +658,7 @@ def _format_user_stats_text(s: dict) -> str:
         line("mines", "Сапёр"),
         line("roulette", "Рулетка"),
         line("slot", "Слот"),
+        line("dice", "Кубик"),
         "",
         f"Всего выиграно (нетто по играм): {totals.get('won', 0)}",
         f"Всего проиграно: {totals.get('lost', 0)}",
@@ -630,6 +701,7 @@ def _format_daily_quests_text(q: dict) -> str:
     rrw = q.get("reward_roulette")
     rm = q.get("reward_mines")
     rs = q.get("reward_slot")
+    rd = q.get("reward_dice")
 
     lines = [
         f"📅 Ежедневные задания ({q.get('day', '')})\n"
@@ -667,6 +739,13 @@ def _format_daily_quests_text(q: dict) -> str:
             q.get("slot_plays", 0),
             DAILY_SLOT_SPINS,
             f"Покрутить /slot {DAILY_SLOT_SPINS} раз",
+            f"награда {DAILY_QUEST_REWARD}",
+        ),
+        row(
+            bool(rd),
+            q.get("dice_plays", 0),
+            DAILY_DICE_ROLLS,
+            f"Сыграть в /dice {DAILY_DICE_ROLLS} раз",
             f"награда {DAILY_QUEST_REWARD}",
         ),
     ]
@@ -1904,6 +1983,7 @@ BOT_COMMANDS = [
     BotCommand(command="transfer", description="Перевести мимрики"),
     BotCommand(command="coinflip", description="50/50: удвоить или проиграть"),
     BotCommand(command="slot", description="Слот (куб 🎰)"),
+    BotCommand(command="dice", description="Кубик 🎲: угадать 1–6, ×10"),
     BotCommand(command="mines", description="Сапёр 5×5, множители до ×100"),
     BotCommand(command="roulette", description="Рулетка: цвета и числа"),
     BotCommand(command="rob", description="Попытаться украсть мимрики"),
